@@ -1,0 +1,9 @@
+[project]
+name = "automated-ai-customer-support"
+version = "0.1.0"
+description = "A multi-model support triage system built with PydanticAI. Uses Ollama for local intent classification and OpenAI for complex reasoning with strict schema validation."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pydantic>=2.12.5",
+]
