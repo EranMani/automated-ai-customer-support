@@ -1,4 +1,4 @@
-from config import AppContext
+from src.config import AppContext
 from pydantic_ai import RunContext
 
 def fetch_user_tier(ctx: RunContext[AppContext], email: str) -> str:
