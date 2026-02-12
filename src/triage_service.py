@@ -1,7 +1,7 @@
-from agents import classifier_agent, specialist_agent
-from config import AppContext, MAX_RETRIES
-from db import MockDB
-from schemas import FinalTriageResponse, RequestCategory
+from src.agents import classifier_agent, specialist_agent
+from src.config import AppContext, MAX_RETRIES
+from src.db import MockDB
+from src.schemas import FinalTriageResponse, RequestCategory, CustomerRequestResult
 from pydantic_ai import ModelRequest, UserPromptPart
 
 async def run_triage(user_query: str, user_email: str) -> FinalTriageResponse:
@@ -9,9 +9,7 @@ async def run_triage(user_query: str, user_email: str) -> FinalTriageResponse:
     ctx = AppContext(db=db_instance)
     message_history = []
 
-    classifier_prompt = f"User Email: {user_email}\nQuery: {user_query}"
-    classifier_response = await classifier_agent.run(user_prompt=classifier_prompt)
-
+    classifier_response = await classifier_agent.run(user_prompt=user_query)
     intent = classifier_response.output.category
 
     """
