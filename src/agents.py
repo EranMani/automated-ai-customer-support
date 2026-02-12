@@ -1,13 +1,13 @@
 from pydantic import BaseModel
-from pydantic_ai import Agent, RunContext
-from config import AppContext, CLASSIFIER_MODEL, CLASSIFIER_SYSTEM_PROMPT, SPECIALIST_MODEL
-from tools import fetch_user_tier, fetch_order_status
-from schemas import CustomerRequestResult, FinalTriageResponse
+from pydantic_ai import Agent, RunContext, PromptedOutput
+from src.config import AppContext, CLASSIFIER_MODEL, CLASSIFIER_SYSTEM_PROMPT, SPECIALIST_MODEL
+from src.tools import fetch_user_tier, fetch_order_status
+from src.schemas import CustomerRequestResult, FinalTriageResponse
 
 # the agent that classifies the customer request
 classifier_agent = Agent(
     model=CLASSIFIER_MODEL,
-    output_type=CustomerRequestResult,
+    output_type=PromptedOutput(CustomerRequestResult),
     system_prompt=CLASSIFIER_SYSTEM_PROMPT
 )
 
@@ -27,6 +27,10 @@ def read_database(ctx: RunContext[AppContext]) -> str:
         You can find the following information in the database:
         - User tier
         - Order status
+        
+        CRITICAL: When looking up orders, order IDs in the database include the '#' symbol.
+        If a customer says "order #123", you MUST use "#123" (with the #) when calling fetch_order_status.
+        Do NOT remove the # symbol - it is required for database lookups.
     """
 
 
