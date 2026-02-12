@@ -9,3 +9,10 @@ from db import MockDB
 class AppContext:
     """Application context that includes a connection to the mock database"""
     db: MockDB
+
+CLASSIFIER_MODEL = "ollama:llama3.2"
+SPECIALIST_MODEL = "openai:gpt-5-nano"
+
+CLASSIFIER_SYSTEM_PROMPT = """
+    You are a triage expert. Analyze the customer message and categorize it.
+"""
