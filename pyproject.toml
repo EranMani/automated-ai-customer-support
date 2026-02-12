@@ -5,6 +5,7 @@ description = "A multi-model support triage system built with PydanticAI. Uses O
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "dotenv>=0.9.9",
     "pydantic>=2.12.5",
     "pydantic-ai>=1.58.0",
 ]
