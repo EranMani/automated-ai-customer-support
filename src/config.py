@@ -16,3 +16,5 @@ SPECIALIST_MODEL = "openai:gpt-5-nano"
 CLASSIFIER_SYSTEM_PROMPT = """
     You are a triage expert. Analyze the customer message and categorize it.
 """
+
+MAX_RETRIES = 3
