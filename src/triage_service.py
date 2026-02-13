@@ -18,9 +18,7 @@ async def process_refunds(ctx: AppContext, order_id: str) -> str:
     except Exception as e:
         return f"ERROR: Could not process refund. Details: {e}"
 
-async def run_triage(user_query: str, user_email: str) -> FinalTriageResponse:
-    db_instance = MockDB()
-    ctx = AppContext(db=db_instance)
+async def run_triage(ctx: AppContext, user_query: str, user_email: str) -> FinalTriageResponse:
     message_history = []
 
     classifier_response = await classifier_agent.run(user_prompt=user_query)
