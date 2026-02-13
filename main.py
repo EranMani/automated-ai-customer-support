@@ -14,9 +14,9 @@ async def main():
     requests = [user1, user2, user3]
 
     results = await asyncio.gather(
-        run_triage(user1["query"], user1["email"]),
-        run_triage(user2["query"], user2["email"]),
-        run_triage(user3["query"], user3["email"])
+        run_triage(ctx, user1["query"], user1["email"]),
+        run_triage(ctx, user2["query"], user2["email"]),
+        run_triage(ctx, user3["query"], user3["email"])
     )
 
     for i, result in enumerate(results):
