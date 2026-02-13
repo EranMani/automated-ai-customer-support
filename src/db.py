@@ -38,3 +38,11 @@ class MockDB():
     def get_user_tier(self, email: str) -> str:
         """Fetch the tier level of a user from the database"""
         return self.users[email]["tier"]
+
+    def update_order_status(self, order_id: str, new_status: str) -> bool:
+        """Update the status of an order. Returns True if successful"""
+        if order_id in self.orders:
+            self.orders[order_id]["status"] = new_status
+            return True
+
+        return False
