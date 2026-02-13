@@ -4,6 +4,20 @@ from src.db import MockDB
 from src.schemas import FinalTriageResponse, RequestCategory, CustomerRequestResult
 from pydantic_ai import ModelRequest, UserPromptPart
 
+async def process_refunds(ctx: AppContext, order_id: str) -> str:
+    """
+        Process the refund for the given order ID
+        If the order is found, update ctx.deps.db with the new order status that is changed to 'REFUNDED'
+        If the order is not found, return "Order ID could not be found."
+    """
+    try:
+        success = ctx.db.update_order_status(order_id, "REFUNDED")
+        if success:
+            return f"SUCCESS: Order {order_id} has been refunded."
+        return f"FAILURE: Order {order_id} could not be refunded."
+    except Exception as e:
+        return f"ERROR: Could not process refund. Details: {e}"
+
 async def run_triage(user_query: str, user_email: str) -> FinalTriageResponse:
     db_instance = MockDB()
     ctx = AppContext(db=db_instance)
