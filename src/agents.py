@@ -21,11 +21,13 @@ specialist_agent = Agent(
 
 @specialist_agent.system_prompt
 def read_database(ctx: RunContext[AppContext]) -> str:
+    # NOTE: I added the customer email in the context to make the agent aware of the user's email
     return f"""
         You are a customer support specialist. Analyze the customer message category and provide a fitting response.
+        The customer's email is: {ctx.deps.user_email}
         YOU MUST ALWAYS check the database before responding to the customer.
         You can find the following information in the database:
-        - User tier
+        - User tier (use the customer's email: {ctx.deps.user_email} to fetch the user tier)
         - Order status
         
         CRITICAL: When looking up orders, order IDs in the database include the '#' symbol.

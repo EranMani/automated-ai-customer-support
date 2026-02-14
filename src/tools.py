@@ -1,13 +1,13 @@
 from src.config import AppContext
 from pydantic_ai import RunContext
 
-def fetch_user_tier(ctx: RunContext[AppContext], email: str) -> str:
+def fetch_user_tier(ctx: RunContext[AppContext]) -> str:
     """
         Fetch the user tier level from the database context by using the provided email address
         If the user is not found, return "User ID could not be found."
     """
     try:
-        return ctx.deps.db.get_user_tier(email)
+        return ctx.deps.db.get_user_tier(ctx.deps.user_email)
     except KeyError:
         return "User ID could not be found."
 

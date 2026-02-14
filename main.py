@@ -1,3 +1,9 @@
+"""
+NOTE: Each agent run gets its own AppContext with the specific user's email
+NOTE: All contexts share the same database instance
+NOTE: The context is the per-request data, the database is the shared infrastructure (distinction between shared resources and per-request data such as user identity, session info)
+"""
+
 import asyncio
 from src.triage_service import run_triage, process_refunds
 from src.db import MockDB
@@ -5,7 +11,6 @@ from src.config import AppContext
 
 async def main():
     db_instance = MockDB()
-    ctx = AppContext(db=db_instance)
 
     user1 = {"email": "user1@gmail.com", "query": "I want a refund for order #123"}
     user2 = {"email": "user2@gmail.com", "query": "What are your business hours?"}
@@ -14,9 +19,9 @@ async def main():
     requests = [user1, user2, user3]
 
     results = await asyncio.gather(
-        run_triage(ctx, user1["query"], user1["email"]),
-        run_triage(ctx, user2["query"], user2["email"]),
-        run_triage(ctx, user3["query"], user3["email"])
+        run_triage(AppContext(db=db_instance, user_email=user1["email"]), user1["query"]),
+        run_triage(AppContext(db=db_instance, user_email=user2["email"]), user2["query"]),
+        run_triage(AppContext(db=db_instance, user_email=user3["email"]), user3["query"])
     )
 
     for i, result in enumerate(results):
@@ -27,7 +32,9 @@ async def main():
         print(f"Dear client: : {result.customer_reply}")
 
         if result.requires_human_approval:
-            await refund_human_feedback(ctx)
+            # Rebuild the context for this specific user
+            user_ctx = AppContext(db=db_instance, user_email=requests[i]["email"])
+            await refund_human_feedback(user_ctx)
             
         print("--------------------------------")
 

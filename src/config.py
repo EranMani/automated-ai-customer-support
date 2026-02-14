@@ -12,6 +12,7 @@ load_dotenv()
 class AppContext:
     """Application context that includes a connection to the mock database"""
     db: MockDB
+    user_email: str
 
 CLASSIFIER_MODEL = "ollama:llama3.2"
 SPECIALIST_MODEL = "openai:gpt-5-nano"
