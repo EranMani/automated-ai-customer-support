@@ -13,6 +13,9 @@ class MockDB():
             },
             "user2@gmail.com": {
                 "tier": "Premium"
+            },
+            "user3@gmail.com": {
+                "tier": "Premium"
             }
         }
 
