@@ -43,7 +43,7 @@ async def main():
 
 async def refund_human_feedback(ctx, order_id: str):
     print("STOP: High-stakes action detected.")
-    # NOTE use hardcoded order number for now. Add it dynanically later
+    # NOTE use hardcoded order number for now. Add it dynamically later
     choice = input(f"Admin, do you approve the refund for Order {order_id}? (Y/N): ").strip().upper()
 
     if choice == "Y":
