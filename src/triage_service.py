@@ -17,15 +17,35 @@ async def process_refunds(ctx: AppContext, order_id: str) -> str:
     except Exception as e:
         return f"ERROR: Could not process refund. Details: {e}"
 
+def apply_business_rules(ctx: AppContext, intent: RequestCategory, output: FinalTriageResponse) -> FinalTriageResponse:
+    requires_human_approval = output.requires_human_approval
+
+    # Business rule: refunds always require human approval
+    if intent == RequestCategory.REFUND:
+        requires_human_approval = True
+
+    # Business rule: verify the order actually exists in the system
+    if output.order_id is not None:
+        try:
+            ctx.db.get_order_status(output.order_id)
+        except KeyError:
+            requires_human_approval = False
+
+    # Business rule: no order = nothing to approve
+    if output.order_id is None:
+        requires_human_approval = False
+
+    return FinalTriageResponse(
+        requires_human_approval=requires_human_approval,
+        order_id=output.order_id,
+        suggested_action=output.suggested_action,
+        customer_reply=output.customer_reply
+    )
+
 async def run_triage(ctx: AppContext, user_query: str) -> FinalTriageResponse:
     classifier_response = await classifier_agent.run(user_prompt=user_query)
     print(f"[Usage] Classifier agent - {classifier_response.usage()}")
     intent = classifier_response.output.category
-
-    """
-        TODO: If it's a refund, we might want to inject extra context, but for now,
-               let's just let the Specialist handle the logic for ALL complex intents.
-    """
 
     if intent == RequestCategory.GENERAL_QUERY:
         # Simple heuristic: General queries might not need the heavy agent
@@ -47,32 +67,14 @@ async def run_triage(ctx: AppContext, user_query: str) -> FinalTriageResponse:
             deps=ctx,
             usage_limits=UsageLimits(request_limit=SPECIALIST_REQUEST_LIMIT, total_tokens_limit=SPECIALIST_TOTAL_TOKENS_LIMIT)
         )
-        requires_human_approval = specialist_response.output.requires_human_approval
-
-        if intent == RequestCategory.REFUND:
-            # NOTE: The classifier's intent drives the approval requirement, not the specialist's judgment
-            requires_human_approval = True
-
-        # Business rule: verify the order actually exists in our system
-        if specialist_response.output.order_id is not None:
-            try:
-                ctx.db.get_order_status(specialist_response.output.order_id)
-            except KeyError:
-                requires_human_approval = False
-
-        # Business rule: no order = nothing to approve
-        if specialist_response.output.order_id is None:
-            requires_human_approval = False
+        
+        # Apply the business rules
+        output = apply_business_rules(ctx, intent, specialist_response.output)
     
         print(f"[Usage] Specialist agent - {specialist_response.usage()}")
 
         # Return the model response
-        return FinalTriageResponse(
-            requires_human_approval=requires_human_approval,
-            order_id=specialist_response.output.order_id,
-            suggested_action=specialist_response.output.suggested_action,
-            customer_reply=specialist_response.output.customer_reply
-        )
+        return output
 
     except Exception as e:
         print(f"Specialist agent failed after retries: {e}")
@@ -122,30 +124,9 @@ async def run_triage_streaming(ctx: AppContext, user_query: str) -> FinalTriageR
             # call usage only after get_output() has been called, otherwise there will be incomplete numbers
             print(f"[Usage] Specialist agent - {result.usage()}")
 
-        # Apply the SAME business rules as run_triage
-        requires_human_approval = output.requires_human_approval
-
-        if intent == RequestCategory.REFUND:
-            requires_human_approval = True
-
-        # Business rule: verify the order actually exists in the system
-        if output.order_id is not None:
-            try:
-                ctx.db.get_order_status(output.order_id)
-            except KeyError:
-                requires_human_approval = False
-
-        # Business rule: no order = nothing to approve
-        if output.order_id is None:
-            requires_human_approval = False
-
-        return FinalTriageResponse(
-            requires_human_approval=requires_human_approval,
-            order_id=output.order_id,
-            suggested_action=output.suggested_action,
-            customer_reply=output.customer_reply
-        )
-
+        output = apply_business_rules(ctx, intent, output)
+        return output
+        
     except Exception as e:
         print(f"Specialist agent failed after retries: {e}")
         return FinalTriageResponse(
