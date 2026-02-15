@@ -15,7 +15,10 @@ class AppContext:
     user_email: str
 
 CLASSIFIER_MODEL = "ollama:llama3.2"
-SPECIALIST_MODEL = "openai:gpt-5-nano"
+SPECIALIST_MODEL = "openai:gpt-4.1-mini"
+
+SPECIALIST_REQUEST_LIMIT = 10
+SPECIALIST_TOTAL_TOKENS_LIMIT = 4000
 
 CLASSIFIER_SYSTEM_PROMPT = """
     You are a triage expert. Analyze the customer message and categorize it.
