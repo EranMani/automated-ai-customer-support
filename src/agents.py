@@ -68,6 +68,12 @@ def fetch_order_status(ctx: RunContext[AppContext], order_id: str) -> str:
 
 @specialist_agent.output_validator
 def validate_specialist_output(ctx: RunContext[AppContext], output: FinalTriageResponse) -> FinalTriageResponse:
+    # Skip validation for partial streaming outputs -- data is still arriving
+    # NOTE: When using run_stream(), the validator is called multiple times with partial outputs. We skip validation for these.
+    # NOTE: ctx.partial_output is exactly how I know whether the model is still generating or done
+    if ctx.partial_output:
+        return output
+
     if not output.customer_reply or len(output.customer_reply.strip()) < 10:
         raise ModelRetry("customer_reply is too short or empty. Provide a meaningful, professional response to the customer.")
 
