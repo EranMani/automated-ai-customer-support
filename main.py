@@ -32,7 +32,6 @@ async def main():
         print(f"--- Test Case {i} ---")
         print(f"--- System Analyzing Request: '{requests[i]["query"]}' ---")
 
-        #print(f"Suggested Action: {result.suggested_action}")
         print(f"Dear client: : {result.customer_reply}")
         if result.requires_human_approval:
             # Rebuild the context for this specific user
@@ -43,7 +42,6 @@ async def main():
 
 async def refund_human_feedback(ctx, order_id: str):
     print("STOP: High-stakes action detected.")
-    # NOTE use hardcoded order number for now. Add it dynamically later
     choice = input(f"Admin, do you approve the refund for Order {order_id}? (Y/N): ").strip().upper()
 
     if choice == "Y":

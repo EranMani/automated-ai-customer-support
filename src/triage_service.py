@@ -1,8 +1,6 @@
 from src.agents import classifier_agent, specialist_agent
-from src.config import AppContext, MAX_RETRIES
-from src.db import MockDB
-from src.schemas import FinalTriageResponse, RequestCategory, CustomerRequestResult
-from pydantic_ai import ModelRequest, UserPromptPart
+from src.config import AppContext
+from src.schemas import FinalTriageResponse, RequestCategory
 
 async def process_refunds(ctx: AppContext, order_id: str) -> str:
     """
