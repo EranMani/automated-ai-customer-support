@@ -20,6 +20,8 @@ SPECIALIST_MODEL = "openai:gpt-4.1-mini"
 SPECIALIST_REQUEST_LIMIT = 10
 SPECIALIST_TOTAL_TOKENS_LIMIT = 4000
 
+IS_STREAM_RESPONSE_OUTPUT = True
+
 CLASSIFIER_SYSTEM_PROMPT = """
     You are a triage expert. Analyze the customer message and categorize it.
 

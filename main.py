@@ -7,9 +7,9 @@ NOTE: Enforce buisness rules deterministically in Python code, not in the LLM
 """
 
 import asyncio
-from src.triage_service import run_triage, process_refunds
+from src.triage_service import run_triage, process_refunds, run_triage_streaming
 from src.db import MockDB
-from src.config import AppContext
+from src.config import AppContext, IS_STREAM_RESPONSE_OUTPUT
 
 async def main():
     db_instance = MockDB()
@@ -21,11 +21,15 @@ async def main():
 
     requests = [user1, user2, user3, user4]
 
+    # Decide which triage function to use based on the configuration.
+    # NOTE: This allows you to switch between streaming and non-streaming output without changing the main logic.
+    triage_func = run_triage_streaming if IS_STREAM_RESPONSE_OUTPUT else run_triage
+
     results = await asyncio.gather(
-        run_triage(AppContext(db=db_instance, user_email=user1["email"]), user1["query"]),
-        run_triage(AppContext(db=db_instance, user_email=user2["email"]), user2["query"]),
-        run_triage(AppContext(db=db_instance, user_email=user3["email"]), user3["query"]),
-        run_triage(AppContext(db=db_instance, user_email=user4["email"]), user4["query"])
+        triage_func(AppContext(db=db_instance, user_email=user1["email"]), user1["query"]),
+        triage_func(AppContext(db=db_instance, user_email=user2["email"]), user2["query"]),
+        triage_func(AppContext(db=db_instance, user_email=user3["email"]), user3["query"]),
+        triage_func(AppContext(db=db_instance, user_email=user4["email"]), user4["query"])
     )
 
     for i, result in enumerate(results):
