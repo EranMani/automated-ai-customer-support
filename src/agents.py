@@ -3,13 +3,13 @@ NOTE: Use ModelRetry when the model output is low quality (vague reply, missing 
 NOTE: Use deterministic override in application code when the model output violates a business rule	
 NOTE: LLM decides what the customer said, what they want, how to reply
 NOTE: The code decides whether the data is real, whether the action is allowed, whether approval is needed
+NOTE: Use @agent.tool decorator for agent-specific tools
+NOTE: For shared utilities used across multiple agents, pass them via the agent constructor's tools list parameter.
+NOTE: Combining agent tool with the system prompt and output validator is great to show the agent capability set visible in one place
 """
 
-
-from pydantic import BaseModel
 from pydantic_ai import Agent, RunContext, PromptedOutput, ModelRetry
 from src.config import AppContext, CLASSIFIER_MODEL, CLASSIFIER_SYSTEM_PROMPT, SPECIALIST_MODEL, MAX_RETRIES
-from src.tools import fetch_user_tier, fetch_order_status
 from src.schemas import CustomerRequestResult, FinalTriageResponse
 
 # the agent that classifies the customer request
@@ -23,7 +23,6 @@ classifier_agent = Agent(
 specialist_agent = Agent(
     model=SPECIALIST_MODEL,
     output_type=FinalTriageResponse,
-    tools=[fetch_user_tier, fetch_order_status],
     deps_type=AppContext,
     retries=MAX_RETRIES
 )
@@ -43,6 +42,28 @@ def read_database(ctx: RunContext[AppContext]) -> str:
         If a customer says "order #123", you MUST use "#123" (with the #) when calling fetch_order_status.
         Do NOT remove the # symbol - it is required for database lookups.
     """
+
+@specialist_agent.tool
+def fetch_user_tier(ctx: RunContext[AppContext]) -> str:
+    """
+        Fetch the user tier level from the database context by using the provided email address
+        If the user is not found, return "User ID could not be found."
+    """
+    try:
+        return ctx.deps.db.get_user_tier(ctx.deps.user_email)
+    except KeyError:
+        return "User ID could not be found."
+
+@specialist_agent.tool
+def fetch_order_status(ctx: RunContext[AppContext], order_id: str) -> str:
+    """
+        Fetch the order status from the database context by using the provided order ID
+        If the order is not found, return "Order ID could not be found."
+    """
+    try:
+        return ctx.deps.db.get_order_status(order_id)
+    except KeyError:
+        return "Order ID could not be found."
 
 @specialist_agent.output_validator
 def validate_specialist_output(ctx: RunContext[AppContext], output: FinalTriageResponse) -> FinalTriageResponse:
