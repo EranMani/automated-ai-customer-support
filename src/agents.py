@@ -1,3 +1,11 @@
+"""
+NOTE: Use ModelRetry when the model output is low quality (vague reply, missing detail)
+NOTE: Use deterministic override in application code when the model output violates a business rule	
+NOTE: LLM decides what the customer said, what they want, how to reply
+NOTE: The code decides whether the data is real, whether the action is allowed, whether approval is needed
+"""
+
+
 from pydantic import BaseModel
 from pydantic_ai import Agent, RunContext, PromptedOutput, ModelRetry
 from src.config import AppContext, CLASSIFIER_MODEL, CLASSIFIER_SYSTEM_PROMPT, SPECIALIST_MODEL, MAX_RETRIES

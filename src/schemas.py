@@ -4,6 +4,7 @@ NOTE: Structured output schemas are the contract between the agent and the rest 
 NOTE: Every piece of data your application logic needs to act on should be in the output schema, for example the order_id for the refund logic
 NOTE: This makes the LLM's reasoning actionable in determinsic code
 NOTE: The LLM decides which order needs a refund. The Python code processes the refund. The FinalTriageResponse schema is the bridge between them
+NOTE: Every field in the output schema should be something that only the LLM can provide -- its interpretation, its reasoning, its natural language response
 """
 from pydantic import BaseModel, Field
 from enum import Enum
