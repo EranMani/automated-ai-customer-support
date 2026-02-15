@@ -16,11 +16,13 @@ This document was created from real engineering decisions made while building an
 7. [Tools with @agent.tool](#tools-with-agenttool)
 8. [Output Validation with ModelRetry](#output-validation-with-modelretry)
 9. [Deterministic Business Rule Guardrails](#deterministic-business-rule-guardrails)
-10. [Usage Limits and Cost Control](#usage-limits-and-cost-control)
-11. [Multi-Agent Orchestration](#multi-agent-orchestration)
-12. [Model Selection Guidelines](#model-selection-guidelines)
-13. [Common Mistakes to Avoid](#common-mistakes-to-avoid)
-14. [Blueprint: Create Any Agent from a Description](#blueprint-create-any-agent-from-a-description)
+10. [Extracting Shared Business Logic](#extracting-shared-business-logic)
+11. [Usage Limits and Cost Control](#usage-limits-and-cost-control)
+12. [Streaming](#streaming)
+13. [Multi-Agent Orchestration](#multi-agent-orchestration)
+14. [Model Selection Guidelines](#model-selection-guidelines)
+15. [Common Mistakes to Avoid](#common-mistakes-to-avoid)
+16. [Blueprint: Create Any Agent from a Description](#blueprint-create-any-agent-from-a-description)
 
 ---
 
@@ -194,9 +196,17 @@ Rules for tools:
 
 The output validator checks the quality of the LLM's response after it returns structured data.
 
+CRITICAL: If the agent will ever be used with `run_stream()`, the output validator MUST guard against partial outputs. During streaming, the validator is called multiple times -- once for each partial output as tokens arrive, and once for the final complete output. Early partial outputs will have empty or incomplete fields. Without the `ctx.partial_output` guard, the validator will raise `ModelRetry` on incomplete data and kill the stream before the model finishes generating.
+
 ```python
 @specialist_agent.output_validator
 def validate_output(ctx: RunContext[AppContext], output: FinalTriageResponse) -> FinalTriageResponse:
+    # REQUIRED: Skip validation for partial streaming outputs -- data is still arriving
+    # ctx.partial_output is True when the validator is called during streaming on incomplete data
+    # ctx.partial_output is False when it's the final complete output
+    if ctx.partial_output:
+        return output
+
     if not output.customer_reply or len(output.customer_reply.strip()) < 10:
         raise ModelRetry(
             "customer_reply is too short or empty. Provide a meaningful, professional response."
@@ -218,7 +228,21 @@ When to use `ModelRetry` vs deterministic override:
 `ModelRetry` re-prompts the model with your error message. Use it when the model CAN fix the problem.
 Deterministic overrides silently correct the output. Use them when only your code knows the right answer.
 
+### What `ctx` provides in the output validator
+
+The `ctx` parameter (`RunContext[AppContext]`) carries metadata about the current state of the agent run:
+
+- **`ctx.deps`** -- your `AppContext` (database, user email). Same as in tools and system prompts.
+- **`ctx.partial_output`** -- boolean. `True` during streaming when data is still arriving, `False` on the final complete output. ALWAYS check this first in validators.
+- **`ctx.usage`** -- current token usage for this run so far.
+- **`ctx.messages`** -- the conversation messages exchanged so far.
+- **`ctx.run_id`** -- unique identifier for this specific agent run.
+
 ### Step 7: Run the Agent
+
+There are two ways to run an agent: standard (blocking) and streaming.
+
+**Standard run** -- waits for the full response, then returns it:
 
 ```python
 from pydantic_ai import UsageLimits
@@ -229,13 +253,38 @@ specialist_response = await specialist_agent.run(
     usage_limits=UsageLimits(request_limit=10, total_tokens_limit=4000)
 )
 
-# Access the structured output
+# Access the structured output directly via .output
 print(specialist_response.output.customer_reply)
 print(specialist_response.output.order_id)
 
 # Track usage for cost monitoring
 print(specialist_response.usage())
 ```
+
+**Streaming run** -- tokens arrive as they are generated:
+
+```python
+async with specialist_agent.run_stream(
+    user_prompt=user_query,
+    deps=AppContext(db=db_instance, user_email="user@example.com"),
+    usage_limits=UsageLimits(request_limit=10, total_tokens_limit=4000)
+) as result:
+    # Stream partial structured output as it arrives
+    async for partial_output in result.stream_output():
+        if partial_output.customer_reply:
+            print(f"\r{partial_output.customer_reply}", end="", flush=True)
+
+    print()
+
+    # IMPORTANT: Use await result.get_output(), NOT result.output
+    # run_stream() returns a stream that might still be in progress
+    output = await result.get_output()
+
+    # Only call usage() after get_output() -- otherwise numbers are incomplete
+    print(result.usage())
+```
+
+See the [Streaming](#streaming) section for full details on streaming patterns and pitfalls.
 
 ---
 
@@ -445,6 +494,55 @@ Don't ask the LLM to tell you something you can verify yourself:
 
 ---
 
+## Extracting Shared Business Logic
+
+When you have multiple ways to run the same agent (standard and streaming), the business rules must be identical. Duplicating business rules across functions is a liability -- if you update one and forget the other, you have inconsistent behavior.
+
+Extract shared logic into a dedicated function:
+
+```python
+def apply_business_rules(ctx: AppContext, intent: RequestCategory, output: FinalTriageResponse) -> FinalTriageResponse:
+    requires_human_approval = output.requires_human_approval
+
+    # Business rule: refunds always require human approval
+    if intent == RequestCategory.REFUND:
+        requires_human_approval = True
+
+    # Business rule: verify the order actually exists in the system
+    if output.order_id is not None:
+        try:
+            ctx.db.get_order_status(output.order_id)
+        except KeyError:
+            requires_human_approval = False
+
+    # Business rule: no order = nothing to approve
+    if output.order_id is None:
+        requires_human_approval = False
+
+    return FinalTriageResponse(
+        requires_human_approval=requires_human_approval,
+        order_id=output.order_id,
+        suggested_action=output.suggested_action,
+        customer_reply=output.customer_reply
+    )
+```
+
+Both `run_triage()` and `run_triage_streaming()` call this same function:
+
+```python
+# In run_triage (standard):
+output = apply_business_rules(ctx, intent, specialist_response.output)
+
+# In run_triage_streaming (streaming):
+output = apply_business_rules(ctx, intent, output)
+```
+
+### The rule
+
+Any logic that applies regardless of HOW the agent was run (standard vs streaming) belongs in a shared function. Business rules, data validation, and post-processing are all candidates for extraction. The run mode (standard vs streaming) is a transport concern -- it should never affect business decisions.
+
+---
+
 ## Usage Limits and Cost Control
 
 Every agent run should have cost guardrails.
@@ -480,6 +578,135 @@ This is why the specialist uses ~2000 input tokens across 4 requests. It is not 
 
 - **Reasoning models** (gpt-5-nano, o-series): Generate internal chain-of-thought tokens. A simple reply can use 1700+ reasoning tokens. Expensive for straightforward tasks.
 - **Non-reasoning models** (gpt-4.1-mini, gpt-4o-mini): No reasoning token overhead. Use these for tasks that don't require deep multi-step thinking.
+
+---
+
+## Streaming
+
+Streaming sends tokens back to the user as they are generated, instead of waiting for the full response. This is essential for any user-facing application.
+
+### `run()` vs `run_stream()` -- Key Differences
+
+| Aspect | `run()` | `run_stream()` |
+|---|---|---|
+| Returns | `AgentRunResult` | Async context manager yielding `StreamedRunResult` |
+| Access output | `result.output` (direct attribute) | `await result.get_output()` (must await) |
+| Output validator | Called once on complete output | Called multiple times on partial + final output |
+| Token delivery | All at once after completion | Progressive as tokens arrive |
+
+### Streaming Structured Output
+
+For agents with structured `output_type` (Pydantic models), use `stream_output()` to receive partial model instances:
+
+```python
+async with specialist_agent.run_stream(
+    user_prompt=user_query,
+    deps=ctx,
+    usage_limits=UsageLimits(request_limit=10, total_tokens_limit=8000)
+) as result:
+    async for partial_output in result.stream_output():
+        if partial_output.customer_reply:
+            print(f"\r{partial_output.customer_reply}", end="", flush=True)
+
+    print()
+    output = await result.get_output()
+    print(f"[Usage] {result.usage()}")
+```
+
+### Streaming Plain Text
+
+For agents that return plain text (no structured `output_type`, or `output_type=str`), use `stream_text()`:
+
+```python
+async with agent.run_stream(user_prompt=query, deps=ctx) as result:
+    async for text in result.stream_text():
+        print(text, end="", flush=True)
+```
+
+For structured output agents, `stream_text()` will give you raw JSON fragments, which is not useful to display. Use `stream_output()` instead.
+
+### CRITICAL RULES for Streaming
+
+**Rule 1: Always guard output validators with `ctx.partial_output`.**
+
+During streaming, the output validator is called on every partial output. Early partials will have empty fields. Without this guard, the validator raises `ModelRetry` before the model finishes generating.
+
+```python
+@agent.output_validator
+def validate(ctx: RunContext[AppContext], output: MyOutput) -> MyOutput:
+    if ctx.partial_output:
+        return output  # ALWAYS skip validation for partial outputs
+    # ... validate final output only ...
+    return output
+```
+
+**Rule 2: Use `await result.get_output()`, not `result.output`.**
+
+`run()` returns a completed result so `.output` works directly.
+`run_stream()` returns a stream in progress. You must explicitly await the final output with `get_output()`.
+
+```python
+# Standard run:
+result = await agent.run(...)
+output = result.output  # Works directly
+
+# Streaming run:
+async with agent.run_stream(...) as result:
+    ...
+    output = await result.get_output()  # Must await
+```
+
+**Rule 3: Call `result.usage()` only after `get_output()`.**
+
+Usage numbers are incomplete until the stream finishes and the final output is resolved.
+
+**Rule 4: Don't mix streaming with `asyncio.gather` carelessly.**
+
+Multiple streams running concurrently will interleave their print output in the terminal, making debugging impossible. When using streaming, either:
+- Run requests sequentially for clear output
+- Or capture streamed output into buffers instead of printing directly
+
+**Rule 5: Business logic is identical between standard and streaming.**
+
+Extract business rules into a shared function that both `run_triage()` and `run_triage_streaming()` call. The streaming mode only changes HOW tokens are delivered, never WHAT business rules apply.
+
+### Architecture: Standard vs Streaming Triage
+
+```
+run_triage()                          run_triage_streaming()
+    |                                     |
+    v                                     v
+classifier_agent.run()                classifier_agent.run()     [same -- no need to stream]
+    |                                     |
+    v                                     v
+specialist_agent.run()                specialist_agent.run_stream()
+    |                                     |
+    v                                     v
+result.output                         stream_output() -> partial prints
+    |                                 await result.get_output()
+    |                                     |
+    v                                     v
+apply_business_rules()                apply_business_rules()    [SAME function, shared]
+    |                                     |
+    v                                     v
+return FinalTriageResponse            return FinalTriageResponse
+```
+
+### Configurable Run Mode
+
+Use a config flag to switch between standard and streaming without changing application logic:
+
+```python
+# config.py
+IS_STREAM_RESPONSE_OUTPUT = True
+
+# main.py
+triage_func = run_triage_streaming if IS_STREAM_RESPONSE_OUTPUT else run_triage
+results = await asyncio.gather(
+    triage_func(AppContext(db=db, user_email=user["email"]), user["query"]),
+    ...
+)
+```
 
 ---
 
@@ -568,6 +795,22 @@ Always verify your model name is valid. Use `result.usage()` to check for unexpe
 **Wrong**: Running an agent with no cost controls -- a tool-call loop can burn your entire budget.
 **Right**: Always set `UsageLimits(request_limit=..., total_tokens_limit=...)`.
 
+### 8. Output validator without partial_output guard
+**Wrong**: Validator checks field lengths without considering streaming partial outputs. The validator fires on empty fields before the model finishes generating them, killing the stream.
+**Right**: Always add `if ctx.partial_output: return output` as the first line of every output validator.
+
+### 9. Using `result.output` with streaming
+**Wrong**: `output = result.output` after `run_stream()` -- `StreamedRunResult` has no `.output` attribute.
+**Right**: `output = await result.get_output()` -- must explicitly await the final output.
+
+### 10. Duplicating business rules across run modes
+**Wrong**: Copy-pasting business rule logic into both `run_triage()` and `run_triage_streaming()`.
+**Right**: Extract into `apply_business_rules()` and call it from both functions.
+
+### 11. Using reasoning models for simple tasks
+**Wrong**: Using `gpt-5-nano` (reasoning model) for a customer support reply. Burns 1700+ reasoning tokens on internal chain-of-thought for a one-sentence answer.
+**Right**: Use non-reasoning models like `gpt-4.1-mini` for straightforward tasks. Reserve reasoning models for tasks that genuinely require multi-step thinking. Check `result.usage()` for unexpected reasoning token overhead.
+
 ---
 
 ## Blueprint: Create Any Agent from a Description
@@ -646,7 +889,7 @@ def validate_summary(ctx: RunContext[SummaryContext], output: DocumentSummary) -
     return output
 ```
 
-**7. Run with usage limits**
+**7. Run with usage limits (standard)**
 
 ```python
 result = await summary_agent.run(
@@ -658,6 +901,22 @@ print(result.output.summary)
 print(result.usage())
 ```
 
+**8. Run with streaming (if user-facing)**
+
+```python
+async with summary_agent.run_stream(
+    user_prompt=document_text,
+    deps=SummaryContext(document_text=document_text, max_summary_length=100),
+    usage_limits=UsageLimits(request_limit=5, total_tokens_limit=8000)
+) as result:
+    async for partial in result.stream_output():
+        if partial.summary:
+            print(f"\r{partial.summary}", end="", flush=True)
+    print()
+    output = await result.get_output()
+    print(result.usage())
+```
+
 ### Checklist for any new agent
 
 - [ ] Output schema defined with Field descriptions
@@ -666,9 +925,13 @@ print(result.usage())
 - [ ] Dynamic system prompt if runtime data is needed
 - [ ] Tools added with @agent.tool if the agent needs to perform actions
 - [ ] Output validator with ModelRetry for quality enforcement
+- [ ] Output validator includes `if ctx.partial_output: return output` guard for streaming compatibility
 - [ ] Business rule guardrails in application code (not in the LLM)
-- [ ] UsageLimits set on every agent.run() call
-- [ ] result.usage() tracked for cost monitoring
+- [ ] Business rules extracted into a shared function if multiple run modes exist (standard + streaming)
+- [ ] UsageLimits set on every agent.run() and agent.run_stream() call
+- [ ] result.usage() tracked for cost monitoring (after get_output() for streaming)
+- [ ] Non-reasoning model chosen unless the task genuinely requires deep reasoning
+- [ ] Streaming support added if the agent is user-facing (run_stream + stream_output)
 
 ---
 
@@ -679,16 +942,19 @@ automated-ai-customer-support/
 ├── main.py                  # Entry point, orchestration, human-in-the-loop
 ├── src/
 │   ├── agents.py            # Agent definitions, system prompts, tools, validators
-│   ├── config.py            # AppContext, model names, constants
+│   ├── config.py            # AppContext, model names, constants, feature flags
 │   ├── schemas.py           # Pydantic output schemas (the contract)
-│   ├── triage_service.py    # Business logic, agent orchestration, guardrails
+│   ├── triage_service.py    # Business logic, agent orchestration, guardrails, streaming
 │   └── db.py                # Database layer (mock or real)
+├── _learning/
+│   └── PYDANTIC_AI_AGENT_GUIDE.md  # This document
 ├── pyproject.toml           # Dependencies
-└── PYDANTIC_AI_AGENT_GUIDE.md  # This document
+└── .env                     # API keys (never commit)
 ```
 
 The separation:
 - `schemas.py` defines WHAT agents return
 - `agents.py` defines HOW agents work (prompts, tools, validation)
-- `triage_service.py` defines WHEN and WHY agents are called (business logic)
+- `triage_service.py` defines WHEN and WHY agents are called (business logic + both standard and streaming run modes)
+- `config.py` defines configuration (models, limits, feature flags like `IS_STREAM_RESPONSE_OUTPUT`)
 - `main.py` handles user interaction and top-level orchestration
