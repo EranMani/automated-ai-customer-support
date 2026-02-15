@@ -1,6 +1,7 @@
 from src.agents import classifier_agent, specialist_agent
-from src.config import AppContext
+from src.config import AppContext, SPECIALIST_REQUEST_LIMIT, SPECIALIST_TOTAL_TOKENS_LIMIT
 from src.schemas import FinalTriageResponse, RequestCategory
+from pydantic_ai import UsageLimits
 
 async def process_refunds(ctx: AppContext, order_id: str) -> str:
     """
@@ -18,6 +19,7 @@ async def process_refunds(ctx: AppContext, order_id: str) -> str:
 
 async def run_triage(ctx: AppContext, user_query: str) -> FinalTriageResponse:
     classifier_response = await classifier_agent.run(user_prompt=user_query)
+    print(f"[Usage] Classifier agent - {classifier_response.usage()}")
     intent = classifier_response.output.category
 
     """
@@ -35,7 +37,16 @@ async def run_triage(ctx: AppContext, user_query: str) -> FinalTriageResponse:
         )
 
     try:
-        specialist_response = await specialist_agent.run(user_prompt=user_query, deps=ctx)
+        """
+            We use usage limits to prevent the agent from using too many tokens and running into rate limits
+            NOTE: request_limit is the amount of round-trips the LLM can do (including tool calls and retries). when it exceeds this, it raises UsageLimitExceeded
+            NOTE: total_tokens_limit is the total input + output tokens across the entire run. Prevents runaway costs.
+        """
+        specialist_response = await specialist_agent.run(
+            user_prompt=user_query, 
+            deps=ctx,
+            usage_limits=UsageLimits(request_limit=SPECIALIST_REQUEST_LIMIT, total_tokens_limit=SPECIALIST_TOTAL_TOKENS_LIMIT)
+        )
         requires_human_approval = specialist_response.output.requires_human_approval
 
         if intent == RequestCategory.REFUND:
@@ -53,7 +64,7 @@ async def run_triage(ctx: AppContext, user_query: str) -> FinalTriageResponse:
         if specialist_response.output.order_id is None:
             requires_human_approval = False
     
-        
+        print(f"[Usage] Specialist agent - {specialist_response.usage()}")
 
         # Return the model response
         return FinalTriageResponse(

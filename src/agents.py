@@ -6,6 +6,7 @@ NOTE: The code decides whether the data is real, whether the action is allowed, 
 NOTE: Use @agent.tool decorator for agent-specific tools
 NOTE: For shared utilities used across multiple agents, pass them via the agent constructor's tools list parameter.
 NOTE: Combining agent tool with the system prompt and output validator is great to show the agent capability set visible in one place
+NOTE: Every agent run has UsageLimits set to prevent runaway costs - a max request count to cap tool-call loops and a token limit as a cost ceiling
 """
 
 from pydantic_ai import Agent, RunContext, PromptedOutput, ModelRetry
