@@ -25,7 +25,8 @@ NOTE: The orchestrator agent comes with few things that might bite:
        When something goes wrong in a 3-layer agent chain, you can't just read the output
        Which agent failed? Did the orchestrator misinterpret the specialist's JSON response? Did the classifier return an unexpected category?
        We need a detailed logging inside each delegate tool.
-       
+NOTE: tools are just text in, text out from the orchestrator's perspective. The orchestrator LLM doesn't know or care whether the tool ran a delegate agent, queried a database, or failed entirely
+      It just reads the returned string and reasons about it. That's why the error messages matter -- they're instructions to the orchestrator about what to do next.
 """
 
 from pydantic_ai import Agent, RunContext, PromptedOutput, ModelRetry
@@ -167,34 +168,44 @@ def orchestrator_prompt(ctx: RunContext[AppContext]) -> str:
 @orchestrator_agent.tool
 async def classify_request(ctx: RunContext[AppContext], customr_message: str) -> str:
     """Classify the customer's message into a category: refund, technical_support, or general_query."""
-    result = await classifier_agent.run(
-        user_prompt=customr_message,
-        usage=ctx.usage
-    )
+    # NOTE: Handle any errors that might happen when running the classifier agent
+    try:
+        result = await classifier_agent.run(
+            user_prompt=customr_message,
+            usage=ctx.usage
+        )
 
-    return f"Category: {result.output.category.value}"
+        return f"Category: {result.output.category.value}"
+    except Exception as e:
+        return f"ERROR: Classification failed: {str(e)}. Treat as general_query."
 
 # This tool calls the specialist agent to handle the customer's support request and returns the response as JSON
 @orchestrator_agent.tool
 async def handle_support_request(ctx: RunContext[AppContext], customer_message: str) -> str:
     """Handle a complex customer support request with database lookups and detailed analysis."""
-    result = await specialist_agent.run(
-        user_prompt=customer_message,
-        deps=ctx.deps,
-        usage=ctx.usage,
-    )
-    return result.output.model_dump_json()
+    try:
+        result = await specialist_agent.run(
+            user_prompt=customer_message,
+            deps=ctx.deps,
+            usage=ctx.usage,
+        )
+        return result.output.model_dump_json()
+    except Exception as e:
+        return f"ERROR: Specialist agent failed: {str(e)}. Respond to the customer directly."
 
 # This tool calls the escalation agent to escalate the customer's support request to a human manager and returns the response as JSON
 @orchestrator_agent.tool
 async def escalate_to_manager(ctx: RunContext[AppContext], customer_message: str, reason: str) -> str:
     """Escalate a high-risk case to a human manager. Use for refunds, security issues, or account modifications."""
-    result = await escalation_agent.run(
-        user_prompt=f"Customer message: {customer_message}\nEscalation reason: {reason}",
-        deps=ctx.deps,
-        usage=ctx.usage,
-    )
-    return result.output.model_dump_json()
+    try:
+        result = await escalation_agent.run(
+            user_prompt=f"Customer message: {customer_message}\nEscalation reason: {reason}",
+            deps=ctx.deps,
+            usage=ctx.usage,
+        )
+        return result.output.model_dump_json()
+    except Exception as e:
+        return f"ERROR: Escalation failed: {str(e)}. Flag for manual review."
 
 # This validator ensures the final response is valid and meets the business requirements
 @orchestrator_agent.output_validator
