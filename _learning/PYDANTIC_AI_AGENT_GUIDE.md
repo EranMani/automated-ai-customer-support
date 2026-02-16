@@ -40,38 +40,55 @@ These principles govern every design decision in this codebase:
 
 5. **Co-locate agent capabilities.** An agent's system prompt, tools, and output validator should live together in one place. Anyone reading the code should understand the agent's full capability set at a glance.
 
+6. **Let agents delegate, let Python override.** An orchestrator agent decides which specialist agents to call. But business rules (refund approval, order validation) are always enforced by Python code on the final output, never left to the LLM's judgment.
+
 ---
 
 ## Architecture Overview
+
+This project uses an **agent delegation** pattern. An orchestrator agent is the brain that decides which specialist agents to call. Python code enforces business rules on the final output.
 
 ```
 User Request
     |
     v
-[Classifier Agent] -- Local LLM (Ollama) -- Cheap, fast intent detection
+[Orchestrator Agent] -- Cloud LLM (OpenAI gpt-4.1-mini)
     |
-    |-- GENERAL_QUERY --> Automated FAQ response (no LLM needed)
+    |-- tool: classify_request()
+    |       --> [Classifier Agent] -- Local LLM (Ollama llama3.2) -- Cheap, fast
     |
-    |-- REFUND / TECHNICAL_SUPPORT
-            |
-            v
-      [Specialist Agent] -- Cloud LLM (OpenAI) -- Complex reasoning
-            |
-            |-- Calls tools (fetch_user_tier, fetch_order_status)
-            |-- Output validated by @output_validator
-            |-- Business rules applied deterministically
-            |
-            v
-      [Human Approval] -- If refund + order exists --> Admin confirms
-            |
-            v
-      [Process Action] -- Database update
+    |-- tool: handle_support_request()
+    |       --> [Specialist Agent] -- Cloud LLM (OpenAI gpt-4.1-mini)
+    |               |-- tool: fetch_user_tier()
+    |               |-- tool: fetch_order_status()
+    |               |-- @output_validator
+    |
+    |-- tool: escalate_to_manager()
+    |       --> [Escalation Agent] -- Cloud LLM (OpenAI gpt-4.1-mini)
+    |               |-- @output_validator
+    |
+    Orchestrator combines all results into FinalTriageResponse
+    |
+    v
+[apply_business_rules()] -- Python code overrides LLM decisions
+    |
+    |-- Refund detected? --> force requires_human_approval = True
+    |-- Order doesn't exist in DB? --> force requires_human_approval = False
+    |-- No order ID? --> force requires_human_approval = False
+    |
+    v
+[Human Approval] -- If requires_human_approval --> Admin confirms
+    |
+    v
+[Process Action] -- Database update
 ```
 
 Key design decisions:
-- **Two models**: Cheap local model for classification, capable cloud model for complex reasoning
-- **Structured output at every stage**: Classifier returns `CustomerRequestResult`, specialist returns `FinalTriageResponse`
-- **Business rules in Python**: Refund approval is enforced by code, not by the LLM's judgment
+- **Agent delegation**: The orchestrator LLM decides which agents to call and in what order, instead of hardcoded Python `if/else` routing
+- **Multiple models**: Cheap local model (Ollama) for classification, capable cloud model (OpenAI) for complex reasoning and orchestration
+- **Structured output at every stage**: Classifier returns `CustomerRequestResult`, specialist returns `FinalTriageResponse`, escalation returns `EscalationResponse`
+- **Business rules in Python**: Refund approval, order existence checks, and approval flags are enforced by code, never by the LLM's judgment
+- **Usage roll-up**: All delegate agents pass `usage=ctx.usage` so the orchestrator tracks total cost across the entire chain
 
 ---
 
@@ -264,7 +281,7 @@ print(specialist_response.usage())
 **Streaming run** -- tokens arrive as they are generated:
 
 ```python
-async with specialist_agent.run_stream(
+async with orchestrator_agent.run_stream(
     user_prompt=user_query,
     deps=AppContext(db=db_instance, user_email="user@example.com"),
     usage_limits=UsageLimits(request_limit=10, total_tokens_limit=4000)
@@ -310,7 +327,25 @@ class FinalTriageResponse(BaseModel):
     customer_reply: str = Field(
         description="A single concise sentence to say to the customer. Must be friendly and professional."
     )
+    category: RequestCategory = Field(
+        description="The classified category of the user's request"
+    )
 ```
+
+### Example: EscalationResponse
+
+Used by the escalation agent for high-risk cases that require human review:
+
+```python
+class EscalationResponse(BaseModel):
+    """Internal escalation report for high-risk customer cases"""
+    severity: str = Field(description="Severity level: 'low', 'medium', 'high', or 'critical'")
+    department: str = Field(description="Which department should handle this: 'billing', 'security', or 'management'")
+    internal_memo: str = Field(description="A detailed internal summary for the human reviewer explaining why this case was escalated and what action is recommended.")
+    customer_reply: str = Field(description="A professional message to send the customer while their case is being reviewed.")
+```
+
+Note: Different agents can have different output schemas. The orchestrator returns `FinalTriageResponse`, the escalation agent returns `EscalationResponse`. Each schema is tailored to what that specific agent needs to communicate.
 
 ### Design principles
 
@@ -461,25 +496,25 @@ LLMs are probabilistic. They interpret context and make judgment calls. Sometime
 
 ### Example: Refund approval
 
-The classifier tagged the request as a REFUND. The specialist agent might set `requires_human_approval=False` because the order status says "Refund Processing" and the LLM interprets that as "already handled." Your business rule says every refund needs human approval, regardless.
+The orchestrator's output includes a `category` field (classified via the delegate classifier agent). The LLM might set `requires_human_approval=False` because the order status says "Refund Processing" and it interprets that as "already handled." Your business rule says every refund needs human approval, regardless.
 
 ```python
-requires_human_approval = specialist_response.output.requires_human_approval
+requires_human_approval = output.requires_human_approval
 
-# Business rule: refund intent always requires approval
-if intent == RequestCategory.REFUND:
+# Business rule: refund category always requires approval
+if output.category == RequestCategory.REFUND:
     requires_human_approval = True
 
 # Business rule: verify the order actually exists in our system
-if specialist_response.output.order_id is not None:
+if output.order_id is not None:
     try:
-        ctx.db.get_order_status(specialist_response.output.order_id)
+        ctx.db.get_order_status(output.order_id)
     except KeyError:
         # Order doesn't exist in DB -- nothing to approve
         requires_human_approval = False
 
 # Business rule: no order = nothing to approve
-if specialist_response.output.order_id is None:
+if output.order_id is None:
     requires_human_approval = False
 ```
 
@@ -501,11 +536,11 @@ When you have multiple ways to run the same agent (standard and streaming), the 
 Extract shared logic into a dedicated function:
 
 ```python
-def apply_business_rules(ctx: AppContext, intent: RequestCategory, output: FinalTriageResponse) -> FinalTriageResponse:
+def apply_business_rules(ctx: AppContext, output: FinalTriageResponse) -> FinalTriageResponse:
     requires_human_approval = output.requires_human_approval
 
     # Business rule: refunds always require human approval
-    if intent == RequestCategory.REFUND:
+    if output.category == RequestCategory.REFUND:
         requires_human_approval = True
 
     # Business rule: verify the order actually exists in the system
@@ -522,19 +557,22 @@ def apply_business_rules(ctx: AppContext, intent: RequestCategory, output: Final
     return FinalTriageResponse(
         requires_human_approval=requires_human_approval,
         order_id=output.order_id,
+        category=output.category,
         suggested_action=output.suggested_action,
         customer_reply=output.customer_reply
     )
 ```
 
+Note: With the orchestrator pattern, the `category` is now part of the `FinalTriageResponse` output itself (the orchestrator classifies via a tool and includes the category in its final response). This means `apply_business_rules` no longer needs a separate `intent` parameter -- it reads `output.category` directly.
+
 Both `run_triage()` and `run_triage_streaming()` call this same function:
 
 ```python
 # In run_triage (standard):
-output = apply_business_rules(ctx, intent, specialist_response.output)
+output = apply_business_rules(ctx, result.output)
 
 # In run_triage_streaming (streaming):
-output = apply_business_rules(ctx, intent, output)
+output = apply_business_rules(ctx, output)
 ```
 
 ### The rule
@@ -599,10 +637,10 @@ Streaming sends tokens back to the user as they are generated, instead of waitin
 For agents with structured `output_type` (Pydantic models), use `stream_output()` to receive partial model instances:
 
 ```python
-async with specialist_agent.run_stream(
+async with orchestrator_agent.run_stream(
     user_prompt=user_query,
     deps=ctx,
-    usage_limits=UsageLimits(request_limit=10, total_tokens_limit=8000)
+    usage_limits=UsageLimits(request_limit=10, total_tokens_limit=4000)
 ) as result:
     async for partial_output in result.stream_output():
         if partial_output.customer_reply:
@@ -612,6 +650,8 @@ async with specialist_agent.run_stream(
     output = await result.get_output()
     print(f"[Usage] {result.usage()}")
 ```
+
+Note: Streaming works with the orchestrator agent just like any other agent. The orchestrator will call its delegate tools (classifier, specialist, escalation) and then stream its final `FinalTriageResponse` back to you. The delegate calls happen during the stream but aren't directly visible -- you only see the final structured output as it generates.
 
 ### Streaming Plain Text
 
@@ -672,14 +712,17 @@ Extract business rules into a shared function that both `run_triage()` and `run_
 
 ### Architecture: Standard vs Streaming Triage
 
+With the orchestrator pattern, both modes call the same orchestrator agent. The only difference is how tokens are delivered:
+
 ```
 run_triage()                          run_triage_streaming()
     |                                     |
     v                                     v
-classifier_agent.run()                classifier_agent.run()     [same -- no need to stream]
+orchestrator_agent.run()              orchestrator_agent.run_stream()
     |                                     |
-    v                                     v
-specialist_agent.run()                specialist_agent.run_stream()
+    | (internally calls delegates:        | (internally calls delegates:
+    |  classifier, specialist,            |  classifier, specialist,
+    |  escalation via tools)              |  escalation via tools)
     |                                     |
     v                                     v
 result.output                         stream_output() -> partial prints
@@ -712,35 +755,173 @@ results = await asyncio.gather(
 
 ## Multi-Agent Orchestration
 
-This project uses two agents in a programmatic hand-off pattern:
+There are two main patterns for running multiple agents together. This project evolved from the simpler pattern to the more powerful one.
+
+### Pattern 1: Programmatic Hand-Off (simple, deterministic)
+
+Python code calls agents in sequence. Your code decides the flow with `if/else` logic:
 
 ```python
 async def run_triage(ctx: AppContext, user_query: str) -> FinalTriageResponse:
-    # Agent 1: Classify intent (cheap, local model)
+    # Python code calls classifier
     classifier_response = await classifier_agent.run(user_prompt=user_query)
     intent = classifier_response.output.category
 
-    # Route based on classification
+    # Python code decides what to do next
     if intent == RequestCategory.GENERAL_QUERY:
-        return FinalTriageResponse(...)  # No LLM needed
+        return FinalTriageResponse(...)
 
-    # Agent 2: Handle complex requests (capable cloud model)
+    # Python code calls specialist
     specialist_response = await specialist_agent.run(user_prompt=user_query, deps=ctx)
-
-    # Apply business rules to the specialist's output
-    ...
-    return FinalTriageResponse(...)
+    return specialist_response.output
 ```
 
-### Why two agents?
+**Pros**: Deterministic flow, easy to debug, cheap (only calls agents when needed).
+**Cons**: Rigid. Can't handle unexpected cases. Every routing decision must be hardcoded.
 
-- **Cost**: The classifier uses a free local model (Ollama). Only complex requests hit the paid OpenAI API.
-- **Speed**: Local classification is fast. The specialist only runs when needed.
-- **Separation of concerns**: The classifier interprets intent. The specialist handles the case. Each has a focused system prompt and output schema.
+### Pattern 2: Agent Delegation (powerful, LLM-driven)
 
-### Running agents in parallel
+An orchestrator agent is the brain. It has tools that delegate to specialized agents. The LLM decides which agents to call and in what order:
 
-Use `asyncio.gather` to run independent agent calls concurrently:
+```
+Orchestrator Agent (the brain)
+    |
+    |-- tool: classify_request()        --> delegates to classifier_agent
+    |-- tool: handle_support_request()  --> delegates to specialist_agent
+    |-- tool: escalate_to_manager()     --> delegates to escalation_agent
+    |
+    Orchestrator sees all results, reasons about them, returns final output
+```
+
+**Pros**: Flexible routing, handles unexpected cases, can call tools in any order or combination.
+**Cons**: Higher token cost (multiple agent round-trips), non-deterministic tool call order, harder to debug.
+
+### How Agent Delegation Works
+
+The orchestrator agent has tools. Each tool internally runs a delegate agent and returns the result as a serialized string:
+
+```python
+orchestrator_agent = Agent(
+    model="openai:gpt-4.1-mini",
+    output_type=FinalTriageResponse,
+    deps_type=AppContext,
+    retries=3
+)
+
+@orchestrator_agent.tool
+async def classify_request(ctx: RunContext[AppContext], customer_message: str) -> str:
+    """Classify the customer's message into a category."""
+    result = await classifier_agent.run(
+        user_prompt=customer_message,
+        usage=ctx.usage,      # Roll up token usage to the parent
+    )
+    return f"Category: {result.output.category.value}"
+
+@orchestrator_agent.tool
+async def handle_support_request(ctx: RunContext[AppContext], customer_message: str) -> str:
+    """Handle a complex customer support request with database lookups."""
+    result = await specialist_agent.run(
+        user_prompt=customer_message,
+        deps=ctx.deps,         # Pass dependencies to the delegate
+        usage=ctx.usage,       # Roll up token usage to the parent
+    )
+    return result.output.model_dump_json()
+
+@orchestrator_agent.tool
+async def escalate_to_manager(ctx: RunContext[AppContext], customer_message: str, reason: str) -> str:
+    """Escalate a high-risk case to a human manager."""
+    result = await escalation_agent.run(
+        user_prompt=f"Customer message: {customer_message}\nEscalation reason: {reason}",
+        deps=ctx.deps,
+        usage=ctx.usage,
+    )
+    return result.output.model_dump_json()
+```
+
+### Critical Rules for Agent Delegation
+
+**Rule 1: Always pass `usage=ctx.usage` to delegate agents.**
+
+This rolls all token usage from every delegate agent up to the parent. When you call `orchestrator_result.usage()`, you get the TOTAL cost across ALL agents in the chain -- orchestrator + classifier + specialist + escalation. Without this, you lose visibility into the true cost of a run.
+
+**Rule 2: Pass `deps=ctx.deps` to delegates that need dependencies.**
+
+The orchestrator's `AppContext` (database, user email) must be forwarded to delegates. The specialist needs DB access for its tools. The escalation agent needs the user email for its system prompt. Use `ctx.deps` to pass them through.
+
+**Rule 3: Delegate tools return strings, not Pydantic models.**
+
+The delegate agent returns structured output internally (e.g., `FinalTriageResponse`). But the tool function must serialize it to a string for the orchestrator using `model_dump_json()`. The orchestrator reads the JSON string, interprets it, and incorporates it into its own response.
+
+**Rule 4: Add try/except inside delegate tools.**
+
+If a delegate agent fails (connection error, validation error, token limit exceeded), the exception propagates and crashes the entire orchestrator run. Catch errors inside the tool and return an error string so the orchestrator can handle it gracefully:
+
+```python
+@orchestrator_agent.tool
+async def handle_support_request(ctx: RunContext[AppContext], customer_message: str) -> str:
+    """Handle a complex customer support request."""
+    try:
+        result = await specialist_agent.run(
+            user_prompt=customer_message,
+            deps=ctx.deps,
+            usage=ctx.usage,
+        )
+        return result.output.model_dump_json()
+    except Exception as e:
+        return f"ERROR: Specialist agent failed: {str(e)}. Try a different approach."
+```
+
+**Rule 5: The orchestrator's system prompt guides but doesn't guarantee tool order.**
+
+You can instruct the orchestrator to "ALWAYS classify first, then handle support." But the LLM might ignore this. It might skip classification and go straight to the specialist. It might call escalation without calling the specialist first. You cannot guarantee tool call order the same way you can with Python `if/else`. This is the fundamental trade-off of letting the LLM be the brain.
+
+### How the Triage Service Simplifies with Delegation
+
+Before (programmatic hand-off): the triage service contained all routing logic with `if/else`:
+
+```python
+# Before: Python code orchestrates everything
+classifier_response = await classifier_agent.run(...)
+intent = classifier_response.output.category
+if intent == RequestCategory.GENERAL_QUERY:
+    return FinalTriageResponse(...)
+specialist_response = await specialist_agent.run(...)
+# ... many more lines of routing logic
+```
+
+After (agent delegation): the triage service just calls the orchestrator and applies business rules:
+
+```python
+# After: Orchestrator agent handles all routing
+result = await orchestrator_agent.run(user_prompt=user_query, deps=ctx, usage_limits=...)
+output = apply_business_rules(ctx, result.output)
+return output
+```
+
+The orchestrator decides which agents to call. Your Python code only enforces business rules on the final output. Much simpler.
+
+### Token Cost Implications of Delegation
+
+Agent delegation significantly increases token usage. Every delegate call is a full agent run with its own round-trips:
+
+```
+Orchestrator request 1: system prompt + user query + tool definitions  (~500 tokens)
+Orchestrator request 2: decides to call classify_request tool
+    --> Classifier run: ~300 tokens
+Orchestrator request 3: receives classification, decides to call specialist
+    --> Specialist run: ~2000 tokens (includes its own tool calls)
+Orchestrator request 4: receives specialist result, decides to call escalation
+    --> Escalation run: ~800 tokens
+Orchestrator request 5: composes final FinalTriageResponse
+```
+
+Total: 5+ orchestrator requests + 3 delegate agent runs = potentially 5000-10000 tokens per customer query. Set `total_tokens_limit` accordingly (12000-15000 for delegation patterns).
+
+Monitor with `result.usage()` -- this shows the aggregate across ALL agents when you use `usage=ctx.usage`.
+
+### Running Triage in Parallel
+
+Use `asyncio.gather` to run independent triage calls concurrently:
 
 ```python
 results = await asyncio.gather(
@@ -810,6 +991,22 @@ Always verify your model name is valid. Use `result.usage()` to check for unexpe
 ### 11. Using reasoning models for simple tasks
 **Wrong**: Using `gpt-5-nano` (reasoning model) for a customer support reply. Burns 1700+ reasoning tokens on internal chain-of-thought for a one-sentence answer.
 **Right**: Use non-reasoning models like `gpt-4.1-mini` for straightforward tasks. Reserve reasoning models for tasks that genuinely require multi-step thinking. Check `result.usage()` for unexpected reasoning token overhead.
+
+### 12. Not passing `usage=ctx.usage` to delegate agents
+**Wrong**: Calling a delegate agent without `usage=ctx.usage`. The parent agent has no visibility into the delegate's token cost. `orchestrator_result.usage()` only shows the orchestrator's own tokens, hiding the real cost.
+**Right**: Always pass `usage=ctx.usage` to every delegate agent call so usage rolls up to the parent.
+
+### 13. Letting delegate exceptions crash the orchestrator
+**Wrong**: A delegate tool function that lets exceptions propagate. If the specialist agent fails (network error, validation error), the entire orchestrator run crashes.
+**Right**: Wrap delegate calls in `try/except` inside the tool function. Return an error string so the orchestrator can handle it gracefully.
+
+### 14. Returning Pydantic models from delegate tools
+**Wrong**: `return result.output` from a delegate tool -- the orchestrator receives a Python object it cannot interpret.
+**Right**: `return result.output.model_dump_json()` -- serialize to JSON string so the orchestrator can read and reason about the data.
+
+### 15. Missing fields in manual FinalTriageResponse constructors
+**Wrong**: Creating fallback `FinalTriageResponse(requires_human_approval=True, order_id=None, ...)` without all required fields. If you add a new field like `category` to the schema, every manual constructor in fallback/exception paths will fail with `ValidationError: category Field required`.
+**Right**: When adding new required fields to output schemas, search for every manual constructor of that model (especially in `except` blocks) and add the new field with a sensible default like `category="unknown"`.
 
 ---
 
@@ -933,6 +1130,16 @@ async with summary_agent.run_stream(
 - [ ] Non-reasoning model chosen unless the task genuinely requires deep reasoning
 - [ ] Streaming support added if the agent is user-facing (run_stream + stream_output)
 
+### Additional checklist for delegate agents (used inside orchestrator tools)
+
+- [ ] Delegate tool function returns a string (use `model_dump_json()` for structured output)
+- [ ] `usage=ctx.usage` passed to roll up token costs to the parent orchestrator
+- [ ] `deps=ctx.deps` passed if the delegate needs dependency access (DB, user email)
+- [ ] `try/except` inside delegate tool functions to prevent crashing the orchestrator
+- [ ] Error returns are descriptive strings the orchestrator can reason about
+- [ ] Orchestrator system prompt clearly describes available tools and the expected workflow
+- [ ] All manual `FinalTriageResponse` constructors (especially in `except` blocks) include every required field
+
 ---
 
 ## File Structure Reference
@@ -953,8 +1160,8 @@ automated-ai-customer-support/
 ```
 
 The separation:
-- `schemas.py` defines WHAT agents return
-- `agents.py` defines HOW agents work (prompts, tools, validation)
-- `triage_service.py` defines WHEN and WHY agents are called (business logic + both standard and streaming run modes)
+- `schemas.py` defines WHAT agents return (`CustomerRequestResult`, `FinalTriageResponse`, `EscalationResponse`)
+- `agents.py` defines HOW agents work -- all 4 agents live here (classifier, specialist, escalation, orchestrator) along with their system prompts, tools, and validators
+- `triage_service.py` defines WHEN and WHY agents are called (calls the orchestrator, applies business rules, handles both standard and streaming run modes)
 - `config.py` defines configuration (models, limits, feature flags like `IS_STREAM_RESPONSE_OUTPUT`)
-- `main.py` handles user interaction and top-level orchestration
+- `main.py` handles user interaction, creates per-user contexts, and manages the human-in-the-loop approval flow
