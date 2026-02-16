@@ -17,6 +17,7 @@ from src.triage_service import apply_business_rules
           gets the MockDB instance, and passes it into ctx(db). This is a fixture chain -- pytest handles the dependency order automatically.
     NOTE: Pytest creates a new fixture instance for every test function by default. Test A can't accidentally corrupt data for Test B. Each test starts clean.
     NOTE: Pytest discovers test functions by looking for functions that start with test_, The rest of the name describes what's being tested
+    NOTE: Good tests don't just verify tricky cases -- they also guard the happy path against future changes
     NOTE: Run this in terminal - python -m pytest tests/test_business_rules.py -v
 """
 
@@ -48,3 +49,29 @@ def test_refund_forces_human_approval(ctx: AppContext):
 
     # After business rules run, requires_human_approval MUST be True. If it's False, the test fails
     assert result.requires_human_approval is True
+
+# NOTE: this is a regression test in case logic changed in apply_business_rules
+def test_refund_with_approval_already_true(ctx: AppContext):
+    """If the LLM already set approval to True for a refund, it stays True."""
+    output = FinalTriageResponse(
+        requires_human_approval=True,
+        order_id="#123",
+        category=RequestCategory.REFUND,
+        suggested_action="Process refund",
+        customer_reply="Your refund is being processed."
+    )
+    result = apply_business_rules(ctx, output)
+    assert result.requires_human_approval is True
+
+# NOTE: this test verifies that the order of the business rules produces the correct result when two rules conflict
+def test_nonexistent_order_blocks_approval(ctx: AppContext):
+    """If the order_id doesn't exist in the DB, approval must be False."""
+    output = FinalTriageResponse(
+        requires_human_approval=True,
+        order_id="#999",
+        category=RequestCategory.REFUND,
+        suggested_action="Process refund",
+        customer_reply="We'll process your refund for order #999."
+    )
+    result = apply_business_rules(ctx, output)
+    assert result.requires_human_approval is False
