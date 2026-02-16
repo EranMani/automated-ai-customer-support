@@ -11,7 +11,7 @@ NOTE: Every agent run has UsageLimits set to prevent runaway costs - a max reque
 
 from pydantic_ai import Agent, RunContext, PromptedOutput, ModelRetry
 from src.config import AppContext, CLASSIFIER_MODEL, CLASSIFIER_SYSTEM_PROMPT, SPECIALIST_MODEL, MAX_RETRIES
-from src.schemas import CustomerRequestResult, FinalTriageResponse
+from src.schemas import CustomerRequestResult, FinalTriageResponse, EscalationResponse
 
 # the agent that classifies the customer request
 classifier_agent = Agent(
@@ -27,6 +27,40 @@ specialist_agent = Agent(
     deps_type=AppContext,
     retries=MAX_RETRIES
 )
+
+escalation_agent = Agent(
+    model=SPECIALIST_MODEL,
+    output_type=EscalationResponse,
+    deps_type=AppContext,
+    retries=MAX_RETRIES
+)
+
+@escalation_agent.system_prompt
+def escalation_prompt(ctx: RunContext[AppContext]) -> str:
+    return f"""
+        You are a senior customer support escalation specialist.
+        You handle high-risk cases that require careful attention: refunds, security issues, account modifications.
+        The customer's email is: {ctx.deps.user_email}
+        
+        Assess the severity, determine the responsible department, and write a detailed internal memo
+        explaining why this case needs human review and what action you recommend.
+        Also provide a professional holding message for the customer.
+    """
+
+@escalation_agent.output_validator
+def validate_escalation(ctx: RunContext[AppContext], output: EscalationResponse) -> EscalationResponse:
+    # Return the current output if the model is still generating its response
+    if ctx.partial_output:
+        return output
+
+    # Make sure the severity is one of the allowed values
+    if output.severity not in ("low", "medium", "high", "critical"):
+        raise ModelRetry("severity must be one of: 'low', 'medium', 'high', 'critical'")
+
+    # Make sure the internal memo is detailed enough for the human reviewer
+    if len(output.internal_memo.strip()) < 20:
+        raise ModelRetry("internal_memo is too short. Provide a detailed explanation for the human reviewer.")
+    return output
 
 @specialist_agent.system_prompt
 def read_database(ctx: RunContext[AppContext]) -> str:
