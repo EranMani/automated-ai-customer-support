@@ -4,6 +4,8 @@ NOTE: All contexts share the same database instance
 NOTE: The context is the per-request data, the database is the shared infrastructure (distinction between shared resources and per-request data such as user identity, session info)
 NOTE: Use the LLM for what its good at: understanding natural language and generating responses
 NOTE: Enforce buisness rules deterministically in Python code, not in the LLM
+
+NOTE: REMEMBER! LLM provides its interpretation, Python enforces the truth. The schema is a bridge between those two worlds.
 """
 
 import asyncio
