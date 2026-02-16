@@ -255,6 +255,34 @@ The `ctx` parameter (`RunContext[AppContext]`) carries metadata about the curren
 - **`ctx.messages`** -- the conversation messages exchanged so far.
 - **`ctx.run_id`** -- unique identifier for this specific agent run.
 
+### Deep dive: How `ctx.partial_output` works during streaming
+
+When you call `agent.run()` (standard), the output validator runs **once** on the complete output. Simple.
+
+When you call `agent.run_stream()`, the output validator is called **many times** as tokens arrive:
+
+```
+Token 1 arrives:  {"requires_human_approval": true}
+    --> validator called with ctx.partial_output = True
+    --> customer_reply is empty (hasn't arrived yet)
+    --> WITHOUT the guard: validator raises ModelRetry("customer_reply too short") --> STREAM KILLED
+    --> WITH the guard: validator returns output immediately --> stream continues
+
+Token 5 arrives:  {"requires_human_approval": true, "customer_reply": "We have rec"}
+    --> validator called with ctx.partial_output = True
+    --> customer_reply exists but is incomplete
+    --> guard skips validation --> stream continues
+
+Final token:      {"requires_human_approval": true, "customer_reply": "We have received your refund request..."}
+    --> validator called with ctx.partial_output = False (this is the final output)
+    --> NOW full validation runs: length checks, content checks, etc.
+    --> If validation fails: ModelRetry triggers a full retry
+```
+
+This is why `if ctx.partial_output: return output` must be the **first line** of every output validator. Without it, streaming is impossible for any agent with output validation -- the validator will reject every partial output because fields haven't fully materialized yet.
+
+**Key insight**: `ctx.partial_output` is how you can tell whether the model is still generating or done. You don't need a separate flag or state machine. Pydantic AI manages the streaming lifecycle and tells your validator exactly where it is in the process.
+
 ### Step 7: Run the Agent
 
 There are two ways to run an agent: standard (blocking) and streaming.
@@ -351,11 +379,15 @@ Note: Different agents can have different output schemas. The orchestrator retur
 
 1. **Every field the application needs must be in the schema.** If your refund logic needs an order ID, the schema must include `order_id`. The LLM identifies it from the conversation; your code uses it to process the refund.
 
-2. **Field descriptions are instructions to the LLM.** The `description` parameter in `Field()` is sent directly to the model. Write it like you are instructing a person: be specific about format, constraints, and expectations.
+2. **Field descriptions are instructions to the LLM.** The `description` parameter in `Field()` is sent directly to the model as part of the JSON schema. The LLM reads these descriptions to understand what value to produce for each field. Write them like you are instructing a person: be specific about format, constraints, and expectations. A vague description like `"The order"` will get vague results. A precise description like `"The order ID related to the customer's request, if applicable. Must include the '#' symbol, e.g. '#123'."` tells the LLM exactly what format to use.
 
 3. **Use `str | None` for conditional fields.** Not every request involves an order. Making `order_id` optional with `default=None` lets the LLM skip it for general queries.
 
-4. **Don't include fields you can verify yourself.** If you can check whether an order exists by querying your database, don't add `is_order_found: bool` to the schema. The LLM might get it wrong. Verify it in your Python code instead.
+4. **Use string enums, not integer enums.** LLMs generate text. Asking an LLM to produce `"refund"` is far more natural and reliable than asking it to produce `0`. String enums (`class RequestCategory(str, Enum)`) serialize directly into human-readable JSON that the model already understands. Integer enums require the model to memorize an arbitrary mapping between numbers and meanings -- one more thing to get wrong.
+
+5. **Don't include fields you can verify yourself.** If you can check whether an order exists by querying your database, don't add `is_order_found: bool` to the schema. The LLM might say the order exists when it doesn't, or vice versa. Only the database knows the truth. Every field in the schema should be something that **only the LLM can provide** -- its interpretation of the user's intent, its natural language response, the entity it extracted from free text. If your Python code can determine the answer deterministically, keep it out of the schema and verify it in code.
+
+6. **Include fields even if you override them.** The `requires_human_approval` field is overridden by `apply_business_rules()` in many cases. So why include it? Because the LLM provides its **best judgment as a starting point**. For cases that don't hit any of your explicit business rules, the LLM's judgment is the fallback. Python code only overrides when a specific business rule disagrees. If you removed the field entirely, you'd have no default value for edge cases your rules don't cover.
 
 ---
 
@@ -445,7 +477,7 @@ agent_b = Agent(model="...", tools=[get_current_time])
 
 ### Reducing LLM errors in tool calls
 
-If a value is known from context, don't make the LLM provide it as a parameter:
+Every parameter a tool exposes to the LLM is a **decision the LLM must make**. Each decision is an opportunity for error. If the answer is already known (stored in context, derivable from other data), remove it from the tool's parameter list and pull it from `ctx.deps` instead.
 
 ```python
 # BAD: LLM must guess/find the email to pass
@@ -459,7 +491,45 @@ def fetch_user_tier(ctx: RunContext[AppContext]) -> str:
     return ctx.deps.db.get_user_tier(ctx.deps.user_email)
 ```
 
-The fewer parameters the LLM must fill in, the fewer chances for errors.
+Why this matters:
+- In the BAD version, the LLM must figure out the user's email from the conversation, then type it correctly as a parameter. It might hallucinate an email, use the wrong format, or pull the wrong email from a multi-user conversation.
+- In the GOOD version, the email is already in `ctx.deps.user_email` -- set by your Python code when creating the `AppContext`. The LLM just calls the tool with zero parameters. There is literally nothing for it to get wrong.
+
+**The principle: minimize the LLM's decision surface.** Only expose parameters the LLM genuinely needs to decide (like `order_id` in `fetch_order_status`, which the LLM extracts from the user's message). Everything else should come from context.
+
+### Tool docstrings are LLM instructions
+
+The docstring of a tool function is not just for human developers -- it is sent to the LLM as the tool's description. The model reads this description to decide **when** and **how** to call each tool.
+
+```python
+@specialist_agent.tool
+def fetch_order_status(ctx: RunContext[AppContext], order_id: str) -> str:
+    """Fetch the order status from the database using the provided order ID.
+    If the order is not found, return 'Order ID could not be found.'"""
+```
+
+The LLM sees this description alongside all other tool descriptions and uses it to decide which tool to call. A vague docstring like `"""Get status"""` gives the LLM little information to work with. A specific docstring like the example above tells the model exactly what the tool does, what it needs, and what it returns on failure.
+
+### Tool error handling
+
+Tools should return string error messages, not raise exceptions. The LLM needs to understand what went wrong so it can adjust its approach:
+
+```python
+# BAD: Raises an exception -- the LLM gets no useful feedback
+@agent.tool
+def fetch_order(ctx: RunContext[AppContext], order_id: str) -> str:
+    return ctx.deps.db.get_order_status(order_id)  # Raises KeyError if not found
+
+# GOOD: Returns a descriptive error string -- the LLM can react
+@agent.tool
+def fetch_order(ctx: RunContext[AppContext], order_id: str) -> str:
+    try:
+        return ctx.deps.db.get_order_status(order_id)
+    except KeyError:
+        return "Order ID could not be found."
+```
+
+If a tool raises an exception, the agent run might crash. If it returns an error string, the LLM can read the error and try a different approach (e.g., ask the user for clarification, or skip that step).
 
 ---
 
@@ -477,16 +547,37 @@ def validate_output(ctx: RunContext[AppContext], output: FinalTriageResponse) ->
     return output
 ```
 
-How it works:
-1. LLM returns `FinalTriageResponse`
-2. Pydantic validates the JSON against the schema (catches type errors, missing fields)
-3. Your output validator runs (catches quality issues)
-4. If `ModelRetry` is raised, the error message is sent back to the LLM as feedback
-5. The LLM tries again (up to the `retries` limit on the agent)
-6. If all retries fail, an exception is raised
+### How the ModelRetry feedback loop works
 
-Use `ModelRetry` for problems the model CAN fix: vague responses, missing detail, wrong format.
-Do NOT use it for business logic -- use deterministic overrides instead (see next section).
+The output validator creates a conversation between your code and the LLM:
+
+```
+Step 1: LLM generates JSON output
+Step 2: Pydantic parses the JSON against the schema (catches type errors, missing fields)
+Step 3: Your output validator function runs (catches quality issues)
+Step 4: If validator raises ModelRetry("customer_reply is too short"):
+        --> Pydantic AI takes your error message
+        --> Sends it BACK to the LLM as feedback in the conversation
+        --> The LLM sees: "Your previous output was rejected: customer_reply is too short"
+        --> The LLM tries again with a better response
+Step 5: Steps 2-4 repeat up to the `retries` limit on the agent
+Step 6: If all retries fail, an exception is raised to the caller
+```
+
+This is why the error message you write in `ModelRetry(...)` matters -- the LLM literally reads it. Write it like feedback to a person: tell the model exactly what was wrong and what you expect instead.
+
+### When to use ModelRetry vs deterministic override
+
+Use `ModelRetry` for problems the model CAN fix: vague responses, missing detail, wrong format. The model reads your feedback and adjusts its output.
+
+Do NOT use `ModelRetry` for business rule violations. If the LLM sets `requires_human_approval=False` for a refund, re-prompting won't help -- the LLM made a judgment call based on context, and it might make the same call again. Override it deterministically in Python code instead (see next section).
+
+| Situation | Approach | Why |
+|---|---|---|
+| Output is low quality (vague, too short) | `ModelRetry` in output validator | The model CAN produce a better response if told what was wrong |
+| Output violates a business rule | Deterministic override in application code | Only your code knows the business rule; the model can't reliably enforce it |
+| Output has wrong format | `ModelRetry` in output validator | The model CAN fix formatting when given specific feedback |
+| Output contains a factual claim you can verify | Deterministic check in application code | Don't ask the model to verify facts -- check your database yourself |
 
 ---
 
@@ -526,6 +617,43 @@ Don't ask the LLM to tell you something you can verify yourself:
 
 **LLM provides**: intent interpretation, natural language responses, entity extraction
 **Python enforces**: business rules, data validation, access control
+
+### Why business rules go AFTER the agent, not inside it
+
+There are three places you could try to enforce business rules. Only one is correct:
+
+**Option 1: In the system prompt** (WRONG)
+```
+"You MUST set requires_human_approval to True for all refund requests."
+```
+Problem: The LLM might ignore this. It's a suggestion, not a guarantee. The LLM interprets the order status as "already processing" and decides no approval is needed. System prompts guide behavior -- they don't enforce it.
+
+**Option 2: In the output validator with ModelRetry** (WRONG)
+```python
+@agent.output_validator
+def validate(ctx, output):
+    if output.category == "refund" and not output.requires_human_approval:
+        raise ModelRetry("Refunds always require human approval. Set requires_human_approval to True.")
+```
+Problem: `ModelRetry` asks the LLM to fix the problem. The LLM made a judgment call based on its interpretation of the context. When you tell it "set this to True," it might comply -- or it might reason again that the order is already being refunded and set it back to False. You're in a non-deterministic loop. You might burn all your retries and still not get the right answer, because you're asking a probabilistic system to produce a deterministic result.
+
+**Option 3: In Python code AFTER the agent returns** (CORRECT)
+```python
+output = apply_business_rules(ctx, result.output)
+# Inside: if output.category == RequestCategory.REFUND: requires_human_approval = True
+```
+This is deterministic. It runs once. It always produces the correct result. The LLM provides its best judgment, and Python code silently corrects it where business rules disagree. No retries, no wasted tokens, no non-determinism.
+
+### Why we still ask the LLM for `requires_human_approval`
+
+If Python overrides the value anyway, why include it in the schema at all?
+
+Because the LLM's judgment is the **default fallback**. Your business rules only cover cases you've explicitly coded for (refunds, missing orders). For every other case -- a customer asking to change their shipping address, or requesting account deletion, or reporting fraud -- the LLM's judgment is the only signal you have. By including the field, you get the LLM's assessment for free on every request. Your Python code only overrides the specific cases where you know better.
+
+Think of it as a **layered decision**:
+1. LLM makes its best judgment call for ALL requests (broad coverage)
+2. Python code overrides specific cases where business rules exist (precise enforcement)
+3. For cases without explicit rules, the LLM's judgment stands (graceful fallback)
 
 ---
 
@@ -602,20 +730,44 @@ print(result.usage())
 # RunUsage(input_tokens=2189, output_tokens=222, requests=4, tool_calls=4)
 ```
 
-### Understanding token costs in agentic systems
+### Understanding token costs in agentic systems (token compounding)
 
-Every tool call creates a round-trip. Every round-trip resends the full conversation history. Token usage compounds:
-- Request 1: system prompt + user query (~300 tokens)
-- Request 2: all of the above + tool call + tool result (~600 tokens)
-- Request 3: all of the above + second tool call + result (~900 tokens)
-- Request 4: all of the above + structured output attempt (~1200 tokens)
+**The fundamental reality: LLMs are stateless.** An LLM has no memory between requests. Every single request must include the ENTIRE conversation history -- system prompt, all previous messages, all previous tool calls, all previous tool results. The LLM reads everything from scratch every time.
 
-This is why the specialist uses ~2000 input tokens across 4 requests. It is not a bug -- it is how LLMs work (they are stateless; every request sends the full context).
+This means token usage **compounds** with every round-trip:
+
+```
+Request 1: system prompt + user query                                    = ~300 input tokens
+Request 2: system prompt + user query + tool_call_1 + tool_result_1      = ~600 input tokens
+Request 3: all of the above + tool_call_2 + tool_result_2                = ~900 input tokens
+Request 4: all of the above + structured output attempt                  = ~1200 input tokens
+                                                                    TOTAL: ~3000 input tokens
+```
+
+This is why the specialist agent uses ~2000 input tokens across 4 requests even though the system prompt is only ~300 tokens. It is not a bug, it is not a misconfiguration -- it is how LLMs fundamentally work. Every tool call adds to the conversation history, and every subsequent request resends that growing history.
+
+**Implications for agent design:**
+- Every tool you add increases the potential number of round-trips
+- Long tool results (like large JSON responses) bloat every subsequent request
+- The orchestrator pattern amplifies this: the orchestrator's tool calls include the delegate agents' full results, which are resent in every subsequent orchestrator request
+- Always set `total_tokens_limit` to account for compounding, not just a single request
 
 ### Model selection impacts cost
 
-- **Reasoning models** (gpt-5-nano, o-series): Generate internal chain-of-thought tokens. A simple reply can use 1700+ reasoning tokens. Expensive for straightforward tasks.
-- **Non-reasoning models** (gpt-4.1-mini, gpt-4o-mini): No reasoning token overhead. Use these for tasks that don't require deep multi-step thinking.
+- **Reasoning models** (gpt-5-nano, o-series): Generate internal chain-of-thought tokens called `reasoning_tokens`. These are tokens the model produces while "thinking" -- they don't appear in your output but they count toward your bill. A simple one-sentence customer reply can burn 1700+ reasoning tokens on internal deliberation before producing 50 output tokens. You can see this in `result.usage()` under the `details` field: `'reasoning_tokens': 1728`.
+- **Non-reasoning models** (gpt-4.1-mini, gpt-4o-mini): No reasoning token overhead. The model generates output tokens directly. Use these for tasks that don't require deep multi-step thinking.
+
+**How to detect the problem:** Run your agent and check `result.usage()`. If you see a large `reasoning_tokens` value relative to the actual output, you're paying for thinking the task doesn't need. Switch to a non-reasoning model.
+
+```python
+# Reasoning model output (expensive):
+# RunUsage(input_tokens=1038, output_tokens=1964, details={'reasoning_tokens': 1728}, requests=2)
+# --> 1728 of the 1964 output tokens were just internal thinking!
+
+# Non-reasoning model output (efficient):
+# RunUsage(input_tokens=2189, output_tokens=222, details={'reasoning_tokens': 0}, requests=4)
+# --> All 222 output tokens are actual useful content
+```
 
 ---
 
@@ -850,7 +1002,7 @@ The orchestrator's `AppContext` (database, user email) must be forwarded to dele
 
 **Rule 3: Delegate tools return strings, not Pydantic models.**
 
-The delegate agent returns structured output internally (e.g., `FinalTriageResponse`). But the tool function must serialize it to a string for the orchestrator using `model_dump_json()`. The orchestrator reads the JSON string, interprets it, and incorporates it into its own response.
+The delegate agent returns structured output internally (e.g., `FinalTriageResponse`). But the tool function must serialize it to a string for the orchestrator using `model_dump_json()`. Why? Because tools communicate with the orchestrator LLM via text. The orchestrator is an LLM -- it can only read text. When a tool returns a value, that value becomes part of the conversation that the orchestrator reads. If you return a Python object, the LLM receives something like `<FinalTriageResponse object at 0x...>` which is useless. If you return `model_dump_json()`, the LLM receives readable JSON like `{"customer_reply": "Your refund is being processed...", "order_id": "#123", ...}` that it can reason about and incorporate into its own final response.
 
 **Rule 4: Add try/except inside delegate tools.**
 
@@ -874,6 +1026,92 @@ async def handle_support_request(ctx: RunContext[AppContext], customer_message: 
 **Rule 5: The orchestrator's system prompt guides but doesn't guarantee tool order.**
 
 You can instruct the orchestrator to "ALWAYS classify first, then handle support." But the LLM might ignore this. It might skip classification and go straight to the specialist. It might call escalation without calling the specialist first. You cannot guarantee tool call order the same way you can with Python `if/else`. This is the fundamental trade-off of letting the LLM be the brain.
+
+### Deep Dive: `deps` vs `usage` -- When to Pass Which and Why
+
+When calling a delegate agent from inside an orchestrator tool, you have two context parameters to consider: `deps` and `usage`. They serve completely different purposes, and not every delegate needs both.
+
+| Parameter | What it does | When to pass it |
+|---|---|---|
+| `deps=ctx.deps` | Forwards the `AppContext` (database, user email) to the delegate | Only if the delegate's tools or system prompt need dependency access |
+| `usage=ctx.usage` | Rolls the delegate's token consumption up to the parent's usage tracker | **Always** -- every delegate should report its cost to the parent |
+
+**Example from our project:**
+
+```python
+# classify_request: passes usage ONLY
+# Why: The classifier has no tools, no database access, no system prompt that needs user email.
+# It just reads the message and returns a category. It doesn't need AppContext.
+result = await classifier_agent.run(
+    user_prompt=customer_message,
+    usage=ctx.usage,       # YES: track cost
+    # deps NOT passed      # The classifier doesn't need AppContext
+)
+
+# handle_support_request: passes BOTH
+# Why: The specialist has tools (fetch_user_tier, fetch_order_status) that call ctx.deps.db
+# and a system prompt that reads ctx.deps.user_email. It needs the full AppContext.
+result = await specialist_agent.run(
+    user_prompt=customer_message,
+    deps=ctx.deps,         # YES: specialist needs DB and user email
+    usage=ctx.usage,       # YES: track cost
+)
+
+# escalate_to_manager: passes BOTH
+# Why: The escalation agent's system prompt reads ctx.deps.user_email
+result = await escalation_agent.run(
+    user_prompt=...,
+    deps=ctx.deps,         # YES: escalation needs user email for its prompt
+    usage=ctx.usage,       # YES: track cost
+)
+```
+
+**What happens if you forget `usage=ctx.usage`?** The delegate agents still run fine. But when you call `orchestrator_result.usage()`, you only see the orchestrator's own token consumption. The classifier's 300 tokens, the specialist's 2000 tokens, and the escalation's 800 tokens are invisible. You think the run cost 1000 tokens when it actually cost 4100. In production, this means your cost monitoring is wrong and your budget estimates are off.
+
+**What happens if you forget `deps=ctx.deps`?** The delegate agent crashes immediately if any of its tools or system prompts try to access `ctx.deps`. You'll get an error like `AttributeError: 'NoneType' object has no attribute 'db'` inside the tool function.
+
+### Deep Dive: Exception Propagation Through Agent Layers
+
+In a delegation pattern, exceptions can propagate through multiple layers. Understanding the path is critical for debugging:
+
+```
+Layer 1: main.py calls run_triage()
+    Layer 2: run_triage() calls orchestrator_agent.run()
+        Layer 3: orchestrator calls classify_request tool
+            Layer 4: classify_request calls classifier_agent.run()
+                --> classifier_agent connects to Ollama
+                --> Ollama is not running
+                --> ConnectionError raised
+
+Without try/except in the tool:
+    ConnectionError propagates from Layer 4 --> Layer 3 --> Layer 2
+    orchestrator_agent.run() crashes
+    run_triage()'s except block catches it
+    Returns fallback FinalTriageResponse("I'm sorry, I'm unable to process your request.")
+
+With try/except in the tool:
+    ConnectionError caught at Layer 3 (inside classify_request tool)
+    Tool returns: "ERROR: Classification failed: Connection error"
+    Orchestrator LLM reads the error string
+    Orchestrator can decide: try again, skip classification, or report the issue in its response
+    Much more graceful degradation
+```
+
+**The same applies to validation errors, token limit exceeded, and network timeouts.** Any unhandled exception inside a delegate tool kills the entire orchestrator run. Always wrap delegate calls in `try/except` inside the tool function and return a descriptive error string.
+
+**Debugging tip:** When something goes wrong in a 3-layer agent chain, the top-level error message is often generic ("Orchestrator failed: Connection error"). To find the real cause, add logging inside each delegate tool:
+
+```python
+@orchestrator_agent.tool
+async def classify_request(ctx: RunContext[AppContext], customer_message: str) -> str:
+    try:
+        result = await classifier_agent.run(user_prompt=customer_message, usage=ctx.usage)
+        print(f"[DEBUG] Classifier result: {result.output.category.value}")
+        return f"Category: {result.output.category.value}"
+    except Exception as e:
+        print(f"[ERROR] Classifier failed: {type(e).__name__}: {e}")
+        return f"ERROR: Classification failed: {str(e)}"
+```
 
 ### How the Triage Service Simplifies with Delegation
 
