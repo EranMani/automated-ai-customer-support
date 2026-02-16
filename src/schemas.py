@@ -32,3 +32,10 @@ class FinalTriageResponse(BaseModel):
     order_id: str | None = Field(description="The order ID related to the customer's request, if applicable. Must include the '#' symbol, e.g. '#123'.")
     suggested_action: str = Field(description="How should you respond to the customer's request in a professional and helpful manner?")
     customer_reply: str = Field(description="A single concise sentence that you would say to the customer. It MUST be friendly and professional.")
+
+class EscalationResponse(BaseModel):
+    """Internal escalation report for high-risk customer cases"""
+    severity: str = Field(description="Severity level: 'low', 'medium', 'high', or 'critical'")
+    department: str = Field(description="Which department should handle this: 'billing', 'security', or 'management'")
+    internal_memo: str = Field(description="A detailed internal summary for the human reviewer explaining why this case was escalated and what action is recommended.")
+    customer_reply: str = Field(description="A professional message to send the customer while their case is being reviewed.")
