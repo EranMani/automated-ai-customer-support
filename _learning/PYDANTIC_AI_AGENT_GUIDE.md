@@ -22,7 +22,8 @@ This document was created from real engineering decisions made while building an
 13. [Multi-Agent Orchestration](#multi-agent-orchestration)
 14. [Model Selection Guidelines](#model-selection-guidelines)
 15. [Common Mistakes to Avoid](#common-mistakes-to-avoid)
-16. [Blueprint: Create Any Agent from a Description](#blueprint-create-any-agent-from-a-description)
+16. [Testing Agent Systems](#testing-agent-systems)
+17. [Blueprint: Create Any Agent from a Description](#blueprint-create-any-agent-from-a-description)
 
 ---
 
@@ -1020,8 +1021,23 @@ async def handle_support_request(ctx: RunContext[AppContext], customer_message: 
         )
         return result.output.model_dump_json()
     except Exception as e:
-        return f"ERROR: Specialist agent failed: {str(e)}. Try a different approach."
+        return f"ERROR: Specialist agent failed: {str(e)}. Respond to the customer directly."
 ```
+
+**Error message design matters.** The error string goes straight to the orchestrator LLM as a tool result. The orchestrator reads it and decides what to do next. Each delegate tool should have a different fallback instruction tailored to that tool's role:
+
+```python
+# Classifier fails: suggest a safe default category
+return f"ERROR: Classification failed: {str(e)}. Treat as general_query."
+
+# Specialist fails: tell orchestrator to compose its own reply
+return f"ERROR: Specialist agent failed: {str(e)}. Respond to the customer directly."
+
+# Escalation fails: ensure the case still gets flagged
+return f"ERROR: Escalation failed: {str(e)}. Flag for manual review."
+```
+
+The orchestrator LLM reads these instructions and adapts. If the classifier fails, it treats the request as a general query. If the specialist fails, it writes a response itself. If escalation fails, it flags the case for human review. Each error message is a mini-instruction for graceful degradation.
 
 **Rule 5: The orchestrator's system prompt guides but doesn't guarantee tool order.**
 
@@ -1248,6 +1264,256 @@ Always verify your model name is valid. Use `result.usage()` to check for unexpe
 
 ---
 
+## Testing Agent Systems
+
+Testing AI agent systems requires a different mindset than testing traditional software. You can't predict exactly what an LLM will say, but you CAN test everything around it: business rules, validators, data transformations, and error handling. These deterministic components are where bugs hide and where tests provide the most value.
+
+### The testing principle for AI systems
+
+Separate what's deterministic from what's probabilistic:
+
+| Component | Deterministic? | Testable without LLM? | Test approach |
+|---|---|---|---|
+| `apply_business_rules()` | Yes | Yes | Construct fake outputs, verify rules fire correctly |
+| Output validators | Yes | Yes | Construct fake outputs, verify `ModelRetry` is raised or not |
+| Tool functions | Yes | Yes | Call directly with fake context, verify return values |
+| LLM response quality | No | No | Manual testing, eval frameworks, monitoring |
+
+Focus your automated tests on the deterministic layer. This is where you get fast, free, reliable tests that run in milliseconds with zero API cost.
+
+### Setup: Install pytest
+
+```bash
+uv add --dev pytest pytest-asyncio
+```
+
+`--dev` marks these as development dependencies -- needed for testing, not for running the app.
+
+### Test file structure
+
+```
+tests/
+├── test_business_rules.py    # Tests for apply_business_rules()
+├── test_validators.py        # Tests for output validators
+```
+
+### Testing business rules
+
+Business rule tests verify that `apply_business_rules()` correctly overrides LLM output. The pattern: construct a `FinalTriageResponse` manually (simulating what the LLM would return), pass it through the business rules, and assert the result.
+
+```python
+import pytest
+from src.config import AppContext
+from src.db import MockDB
+from src.schemas import FinalTriageResponse, RequestCategory
+from src.triage_service import apply_business_rules
+
+
+@pytest.fixture
+def db():
+    """Fresh MockDB instance for each test"""
+    return MockDB()
+
+
+@pytest.fixture
+def ctx(db):
+    """AppContext with a test user"""
+    return AppContext(db=db, user_email="user1@gmail.com")
+```
+
+**Fixtures** are reusable setup functions. Pytest automatically injects them into any test that lists them as parameters. Each test gets a fresh instance -- test A can't corrupt data for test B.
+
+**Fixture chains**: The `ctx` fixture depends on `db`. Pytest sees this, runs `db()` first, passes the result into `ctx(db)`. You don't manage the dependency order -- pytest does it for you.
+
+#### Testing that a business rule fires
+
+```python
+def test_refund_forces_human_approval(ctx):
+    """Even if the LLM says no approval needed, refunds always require it."""
+    output = FinalTriageResponse(
+        requires_human_approval=False,  # LLM says no
+        order_id="#123",
+        category=RequestCategory.REFUND,
+        suggested_action="Process refund",
+        customer_reply="Your refund is being processed."
+    )
+    result = apply_business_rules(ctx, output)
+    assert result.requires_human_approval is True
+```
+
+What's happening:
+1. We construct a `FinalTriageResponse` with `requires_human_approval=False` -- simulating an LLM that got it wrong
+2. We pass it through `apply_business_rules` -- the same function that runs in production
+3. We assert the result is `True` -- the refund rule must override the LLM's decision
+
+No LLM was called. We manually constructed the output object to simulate a specific scenario.
+
+#### Testing that a business rule does NOT fire
+
+```python
+def test_tech_support_with_existing_order_preserves_llm_decision(ctx):
+    """For non-refund categories with a valid order, the LLM's decision stands."""
+    output = FinalTriageResponse(
+        requires_human_approval=False,
+        order_id="#123",
+        category=RequestCategory.TECHNICAL_SUPPORT,
+        suggested_action="Help with technical issue",
+        customer_reply="Let me help you with that."
+    )
+    result = apply_business_rules(ctx, output)
+    assert result.requires_human_approval is False
+```
+
+This proves that when no business rule applies, the LLM's judgment passes through unchanged. Equally important as testing that rules fire -- you need to verify they stay out of the way when they shouldn't intervene.
+
+#### Testing data integrity
+
+```python
+def test_other_fields_preserved(ctx):
+    """Business rules should only change requires_human_approval, not other fields."""
+    output = FinalTriageResponse(
+        requires_human_approval=False,
+        order_id="#123",
+        category=RequestCategory.REFUND,
+        suggested_action="Process the refund immediately",
+        customer_reply="Your refund for order #123 is confirmed."
+    )
+    result = apply_business_rules(ctx, output)
+
+    assert result.requires_human_approval is True     # Changed by rule
+    assert result.order_id == "#123"                   # Preserved
+    assert result.category == RequestCategory.REFUND   # Preserved
+    assert result.suggested_action == "Process the refund immediately"  # Preserved
+    assert result.customer_reply == "Your refund for order #123 is confirmed."  # Preserved
+```
+
+When a function transforms data, test both **what changed** and **what should NOT have changed**. The "should not have changed" tests catch the sneakiest bugs -- someone refactors `apply_business_rules`, accidentally forgets to pass `customer_reply` through, and this test catches it instantly.
+
+#### What to test for business rules
+
+Test every combination of conditions that affect the output:
+
+| Scenario | Expected `requires_human_approval` | Why |
+|---|---|---|
+| Refund + LLM says False | True | Refund rule overrides |
+| Refund + LLM says True | True | Refund rule agrees, no change |
+| Refund + non-existent order (#999) | False | Order doesn't exist, nothing to approve |
+| Refund + no order (None) | False | No order, nothing to approve |
+| General query + no order | False | No rule fires, LLM's decision stands |
+| General query + LLM says True + no order | False | No order rule overrides |
+| Tech support + existing order | (LLM's value) | No rule fires |
+| Tech support + non-existent order | False | Order doesn't exist rule fires |
+
+### Testing output validators
+
+Output validators are also deterministic functions. The challenge: they take `RunContext` as a parameter, which Pydantic AI normally creates internally. Solution: use `MagicMock` to fake it.
+
+```python
+from unittest.mock import MagicMock
+from pydantic_ai import ModelRetry
+from src.agents import validate_specialist_output, validate_escalation, validate_orchestrator
+
+
+@pytest.fixture
+def mock_ctx():
+    """Fake RunContext for testing validators outside of a real agent run."""
+    ctx = MagicMock()
+    ctx.partial_output = False  # Test final output validation by default
+    return ctx
+```
+
+**`MagicMock`**: A fake object from Python's standard library that pretends to be anything. When you access any attribute, it returns another `MagicMock` instead of crashing. We only need to set `ctx.partial_output = False` -- the validator checks this first, and we want to test the real validation logic (not the streaming skip).
+
+#### Testing that good output passes through
+
+```python
+def test_specialist_valid_output_passes(mock_ctx):
+    """Good output should pass through the validator unchanged."""
+    output = FinalTriageResponse(
+        requires_human_approval=False,
+        order_id="#123",
+        category=RequestCategory.REFUND,
+        suggested_action="Process the refund for order #123",
+        customer_reply="Your refund for order #123 is being processed. You'll receive confirmation within 3-5 business days."
+    )
+    result = validate_specialist_output(mock_ctx, output)
+    assert result == output
+```
+
+Pydantic `BaseModel` objects support equality comparison -- two instances are equal if all their field values match. So `result == output` verifies every field came through unchanged.
+
+#### Testing that bad output triggers ModelRetry
+
+```python
+def test_specialist_rejects_short_customer_reply(mock_ctx):
+    """customer_reply shorter than 10 characters should trigger ModelRetry."""
+    output = FinalTriageResponse(
+        requires_human_approval=False,
+        order_id="#123",
+        category=RequestCategory.REFUND,
+        suggested_action="Process the refund",
+        customer_reply="Ok."
+    )
+    with pytest.raises(ModelRetry):
+        validate_specialist_output(mock_ctx, output)
+```
+
+**`pytest.raises(ModelRetry)`**: This block says "I expect this code to raise a `ModelRetry` exception. If it does, the test passes. If it doesn't raise, the test fails." It's the opposite of a normal assertion -- you're verifying that the function rejects the input.
+
+**Test one validation rule at a time.** If the validator checks both `customer_reply` length and `suggested_action` length, write separate tests for each. One test has a short `customer_reply` but a good `suggested_action`. The other has a good `customer_reply` but a short `suggested_action`. If a test fails, you know exactly which rule broke.
+
+#### Testing the streaming guard
+
+```python
+def test_specialist_skips_validation_for_partial_output(mock_ctx):
+    """During streaming, partial outputs should skip validation entirely."""
+    mock_ctx.partial_output = True  # Override fixture default
+
+    output = FinalTriageResponse(
+        requires_human_approval=False,
+        order_id=None,
+        category=RequestCategory.GENERAL_QUERY,
+        suggested_action="",       # Would normally fail validation
+        customer_reply=""           # Would normally fail validation
+    )
+    result = validate_specialist_output(mock_ctx, output)
+    assert result == output
+```
+
+Both `suggested_action` and `customer_reply` are empty -- both would trigger `ModelRetry` in normal validation. But `ctx.partial_output = True` simulates streaming, so the validator skips all checks and returns the output immediately. This test guarantees the streaming guard works and can never be accidentally removed.
+
+### Running tests
+
+```bash
+# Run a specific test file
+python -m pytest tests/test_business_rules.py -v
+
+# Run all tests in the tests/ directory
+python -m pytest tests/ -v
+
+# Run with -v for verbose output (shows each test name and PASSED/FAILED)
+```
+
+Use `python -m pytest` (not just `pytest`) to ensure Python sets up import paths correctly from your project root.
+
+### Testing principles for agent systems
+
+1. **Test deterministic code, not LLM output.** You can't reliably assert what an LLM will say. You CAN reliably assert that your business rules, validators, and data transformations work correctly for every possible LLM output.
+
+2. **Construct fake outputs manually.** Don't call the LLM in tests. Build `FinalTriageResponse` objects directly with the specific field values you want to test. This is fast, free, and deterministic.
+
+3. **Test one rule per test function.** Each test should verify one specific behavior. If a test fails, the name tells you exactly what broke: `test_refund_forces_human_approval` is immediately clear.
+
+4. **Test both sides of every rule.** For each business rule, test that it fires when it should AND that it doesn't fire when it shouldn't. Missing the "doesn't fire" test means you might not catch a rule that's too aggressive.
+
+5. **Test edge cases at boundaries.** If a validator rejects strings shorter than 10 characters, test with 3 characters (clearly short), 9 characters (just under), and 10+ characters (passes). Boundary bugs are common.
+
+6. **Use fixtures for shared setup.** Database instances, contexts, and mock objects should be fixtures, not repeated setup code in every test function.
+
+7. **Use `MagicMock` for framework objects.** When testing functions that take Pydantic AI's `RunContext`, create a fake with `MagicMock()` and set only the attributes your function actually accesses.
+
+---
+
 ## Blueprint: Create Any Agent from a Description
 
 Follow this blueprint to create a new agent for any task. This is the process a master agent should follow when building agents from a description.
@@ -1367,6 +1633,9 @@ async with summary_agent.run_stream(
 - [ ] result.usage() tracked for cost monitoring (after get_output() for streaming)
 - [ ] Non-reasoning model chosen unless the task genuinely requires deep reasoning
 - [ ] Streaming support added if the agent is user-facing (run_stream + stream_output)
+- [ ] Unit tests for business rules -- every combination of category, order existence, and edge cases
+- [ ] Unit tests for output validators -- happy path, each rejection rule, and streaming guard (`ctx.partial_output = True`)
+- [ ] Data integrity test -- verify non-approval fields are preserved through business rules
 
 ### Additional checklist for delegate agents (used inside orchestrator tools)
 
@@ -1391,6 +1660,9 @@ automated-ai-customer-support/
 │   ├── schemas.py           # Pydantic output schemas (the contract)
 │   ├── triage_service.py    # Business logic, agent orchestration, guardrails, streaming
 │   └── db.py                # Database layer (mock or real)
+├── tests/
+│   ├── test_business_rules.py  # Tests for apply_business_rules() -- deterministic rule verification
+│   └── test_validators.py      # Tests for output validators -- ModelRetry and streaming guard verification
 ├── _learning/
 │   └── PYDANTIC_AI_AGENT_GUIDE.md  # This document
 ├── pyproject.toml           # Dependencies
@@ -1403,3 +1675,4 @@ The separation:
 - `triage_service.py` defines WHEN and WHY agents are called (calls the orchestrator, applies business rules, handles both standard and streaming run modes)
 - `config.py` defines configuration (models, limits, feature flags like `IS_STREAM_RESPONSE_OUTPUT`)
 - `main.py` handles user interaction, creates per-user contexts, and manages the human-in-the-loop approval flow
+- `tests/` verifies deterministic components (business rules, validators) without LLM calls -- fast, free, reliable
