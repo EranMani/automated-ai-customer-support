@@ -5,6 +5,7 @@ NOTE: Every piece of data your application logic needs to act on should be in th
 NOTE: This makes the LLM's reasoning actionable in determinsic code
 NOTE: The LLM decides which order needs a refund. The Python code processes the refund. The FinalTriageResponse schema is the bridge between them
 NOTE: Every field in the output schema should be something that only the LLM can provide -- its interpretation, its reasoning, its natural language response
+NOTE: FastAPI uses Pydantic models for request validation automatically
 """
 from pydantic import BaseModel, Field
 from enum import Enum
@@ -40,3 +41,8 @@ class EscalationResponse(BaseModel):
     department: str = Field(description="Which department should handle this: 'billing', 'security', or 'management'")
     internal_memo: str = Field(description="A detailed internal summary for the human reviewer explaining why this case was escalated and what action is recommended.")
     customer_reply: str = Field(description="A professional message to send the customer while their case is being reviewed.")
+
+class TriageRequest(BaseModel):
+    """The API request input to the triage agent"""
+    email: str
+    query: str
