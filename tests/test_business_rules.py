@@ -19,6 +19,7 @@ from src.triage_service import apply_business_rules
     NOTE: Pytest discovers test functions by looking for functions that start with test_, The rest of the name describes what's being tested
     NOTE: Good tests don't just verify tricky cases -- they also guard the happy path against future changes
     NOTE: Run this in terminal - python -m pytest tests/test_business_rules.py -v
+    NOTE: Good tests come in pairs -- one where the LLM gets it right, one where it gets it wrong, verifying that business rules fix the wrong cases without breaking the correct ones
 """
 
 
@@ -72,6 +73,45 @@ def test_nonexistent_order_blocks_approval(ctx: AppContext):
         category=RequestCategory.REFUND,
         suggested_action="Process refund",
         customer_reply="We'll process your refund for order #999."
+    )
+    result = apply_business_rules(ctx, output)
+    assert result.requires_human_approval is False
+
+# NOTE: this test verifies that the business rules produce the correct result when the order_id is None
+def test_no_order_id_blocks_approval(ctx):
+    """If there's no order_id at all, approval must be False."""
+    output = FinalTriageResponse(
+        requires_human_approval=True,
+        order_id=None,
+        category=RequestCategory.REFUND,
+        suggested_action="Process refund",
+        customer_reply="We'll look into your refund."
+    )
+    result = apply_business_rules(ctx, output)
+    assert result.requires_human_approval is False
+
+# NOTE: this test verifies that the business rules set requires_human_approval to False when the category is GENERAL_QUERY
+def test_general_query_no_approval(ctx):
+    """General queries should not require approval."""
+    output = FinalTriageResponse(
+        requires_human_approval=False,
+        order_id=None,
+        category=RequestCategory.GENERAL_QUERY,
+        suggested_action="Answer the question",
+        customer_reply="Our business hours are 9-5."
+    )
+    result = apply_business_rules(ctx, output)
+    assert result.requires_human_approval is False
+
+# NOTE: this test verifies that the business rules set requires_human_approval to False when the LLM mistakenly sets it to True for a general query with no order
+def test_general_query_llm_sets_approval_true(ctx):
+    """Even if LLM mistakenly sets approval for a general query with no order, rules override to False."""
+    output = FinalTriageResponse(
+        requires_human_approval=True,
+        order_id=None,
+        category=RequestCategory.GENERAL_QUERY,
+        suggested_action="Answer the question",
+        customer_reply="Our business hours are 9-5."
     )
     result = apply_business_rules(ctx, output)
     assert result.requires_human_approval is False
