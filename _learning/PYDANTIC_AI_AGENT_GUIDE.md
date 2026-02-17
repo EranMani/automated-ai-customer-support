@@ -23,7 +23,8 @@ This document was created from real engineering decisions made while building an
 14. [Model Selection Guidelines](#model-selection-guidelines)
 15. [Common Mistakes to Avoid](#common-mistakes-to-avoid)
 16. [Testing Agent Systems](#testing-agent-systems)
-17. [Blueprint: Create Any Agent from a Description](#blueprint-create-any-agent-from-a-description)
+17. [API Layer with FastAPI](#api-layer-with-fastapi)
+18. [Blueprint: Create Any Agent from a Description](#blueprint-create-any-agent-from-a-description)
 
 ---
 
@@ -47,10 +48,13 @@ These principles govern every design decision in this codebase:
 
 ## Architecture Overview
 
-This project uses an **agent delegation** pattern. An orchestrator agent is the brain that decides which specialist agents to call. Python code enforces business rules on the final output.
+This project uses an **agent delegation** pattern behind an HTTP API. An orchestrator agent is the brain that decides which specialist agents to call. Python code enforces business rules on the final output. FastAPI serves the HTTP layer.
 
 ```
-User Request
+HTTP POST /triage {"email": "...", "query": "..."}
+    |
+    v
+[FastAPI] -- Validates request, creates AppContext, calls run_triage()
     |
     v
 [Orchestrator Agent] -- Cloud LLM (OpenAI gpt-4.1-mini)
@@ -82,14 +86,20 @@ User Request
     |
     v
 [Process Action] -- Database update
+    |
+    v
+[FastAPI Response] -- HTTP 200 + FinalTriageResponse JSON
+                   -- or HTTP 503 if orchestrator failed
 ```
 
 Key design decisions:
+- **HTTP API layer**: FastAPI serves the agent system over HTTP. Pydantic models are shared between agent output and API response -- zero conversion needed.
 - **Agent delegation**: The orchestrator LLM decides which agents to call and in what order, instead of hardcoded Python `if/else` routing
 - **Multiple models**: Cheap local model (Ollama) for classification, capable cloud model (OpenAI) for complex reasoning and orchestration
 - **Structured output at every stage**: Classifier returns `CustomerRequestResult`, specialist returns `FinalTriageResponse`, escalation returns `EscalationResponse`
 - **Business rules in Python**: Refund approval, order existence checks, and approval flags are enforced by code, never by the LLM's judgment
 - **Usage roll-up**: All delegate agents pass `usage=ctx.usage` so the orchestrator tracks total cost across the entire chain
+- **Layered error handling**: Delegate failures absorbed by tools (Layer 1), orchestrator failures caught by triage service (Layer 2), fallback responses converted to HTTP 503 by the API (Layer 3)
 
 ---
 
@@ -110,6 +120,7 @@ class RequestCategory(str, Enum):
     REFUND = "refund"
     TECHNICAL_SUPPORT = "technical_support"
     GENERAL_QUERY = "general_query"
+    UNKNOWN = "unknown"  # Used for fallback responses when the orchestrator fails
 
 class CustomerRequestResult(BaseModel):
     """The result of the customer request classification"""
@@ -375,6 +386,19 @@ class EscalationResponse(BaseModel):
 ```
 
 Note: Different agents can have different output schemas. The orchestrator returns `FinalTriageResponse`, the escalation agent returns `EscalationResponse`. Each schema is tailored to what that specific agent needs to communicate.
+
+### Example: TriageRequest (API input)
+
+Pydantic models serve double duty. They define agent output schemas AND API request validation:
+
+```python
+class TriageRequest(BaseModel):
+    """The API request input to the triage agent"""
+    email: str
+    query: str
+```
+
+FastAPI validates incoming HTTP requests against this model automatically. If `email` or `query` is missing, FastAPI returns HTTP 422 before your agent code runs. The same Pydantic validation you use for agent output now protects your API inputs.
 
 ### Design principles
 
@@ -1514,6 +1538,169 @@ Use `python -m pytest` (not just `pytest`) to ensure Python sets up import paths
 
 ---
 
+## API Layer with FastAPI
+
+Wrapping your agent system in an HTTP API transforms it from a CLI script into a real service. FastAPI is the natural choice because it's built on Pydantic -- the same models you use for agent output serve as API response schemas with zero conversion.
+
+### Why FastAPI + Pydantic AI work together
+
+- `FinalTriageResponse` is both the agent's `output_type` and the API's `response_model`
+- `TriageRequest` validates incoming HTTP requests the same way Pydantic validates agent output
+- Both are async-native -- FastAPI's `async def` endpoints and Pydantic AI's `await agent.run()` use the same event loop
+- FastAPI auto-generates interactive API docs from your Pydantic models at `/docs`
+
+### Setup
+
+```bash
+uv add fastapi uvicorn[standard]
+```
+
+- `fastapi` is the web framework
+- `uvicorn` is the ASGI server. ASGI (Asynchronous Server Gateway Interface) is the async version of WSGI -- it natively supports `async/await`, which is what your agent code needs
+
+### Request schema
+
+Add an input model to `schemas.py` alongside your existing output schemas:
+
+```python
+class TriageRequest(BaseModel):
+    """The API request input to the triage agent"""
+    email: str
+    query: str
+```
+
+FastAPI validates incoming requests against this model automatically. If someone sends a request without `email` or `query`, FastAPI returns a 422 error before your code even runs.
+
+### The API application
+
+```python
+from fastapi import FastAPI, HTTPException
+from src.db import MockDB
+from src.config import AppContext
+from src.schemas import TriageRequest, FinalTriageResponse
+from src.triage_service import run_triage
+
+app = FastAPI(
+    title="AI Customer Support API",
+    description="Multi-agent customer support system powered by Pydantic AI"
+)
+
+# Shared database -- created once at server startup, used by all requests
+db_instance = MockDB()
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+@app.post("/triage", response_model=FinalTriageResponse)
+async def triage(request: TriageRequest):
+    ctx = AppContext(db=db_instance, user_email=request.email)
+    result = await run_triage(ctx, request.query)
+
+    # Detect orchestrator failure (fallback returns category="unknown")
+    if result.category == "unknown":
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "Service temporarily unavailable. Please try again later.",
+                "message": result.customer_reply,
+                "suggested_action": result.suggested_action,
+            }
+        )
+
+    return result
+```
+
+### How async concurrency works (no thread blocking)
+
+This is the most important concept for the API layer. Your agent calls are `async` -- they use `await` for network I/O (LLM API calls). While one request waits for the LLM to respond, the event loop is free to handle other requests.
+
+```
+Request 1 arrives: POST /triage {"email": "user1@...", "query": "I want a refund"}
+    --> FastAPI creates async task 1
+    --> task 1 calls await run_triage()
+    --> orchestrator makes LLM API call (network I/O)
+    --> WHILE WAITING: event loop is free
+
+Request 2 arrives: POST /triage {"email": "user2@...", "query": "Business hours?"}
+    --> FastAPI creates async task 2 (task 1 is still waiting)
+    --> task 2 calls await run_triage()
+    --> task 2's LLM call starts in parallel
+
+Request 1's LLM responds --> task 1 resumes, applies business rules, returns 200
+Request 2's LLM responds --> task 2 resumes, applies business rules, returns 200
+```
+
+**Key difference from `main.py`**: In `main.py`, you use `asyncio.gather()` to run multiple requests in parallel. In FastAPI, parallelism is automatic. Each HTTP request is its own async task. The ASGI server handles concurrency for you -- every `await` is a yield point where other requests can be processed.
+
+**No existing code changes needed.** The API calls `run_triage()` -- the same function that `main.py` calls. Your agents, business rules, validators, and schemas are completely untouched. The API is a new layer on top.
+
+### Error handling with HTTP status codes
+
+Without proper error handling, the API returns HTTP 200 even when the orchestrator fails (because `run_triage` catches exceptions and returns a fallback `FinalTriageResponse`). The caller has no way to distinguish success from failure by status code alone.
+
+The solution: detect the fallback output and return an appropriate HTTP error.
+
+```python
+# Detect orchestrator failure
+if result.category == "unknown":
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "error": "Service temporarily unavailable. Please try again later.",
+            "message": result.customer_reply,
+            "suggested_action": result.suggested_action,
+        }
+    )
+```
+
+**Why `category == "unknown"` is the signal:** When the orchestrator fails, the `except` block in `run_triage` returns a fallback `FinalTriageResponse` with `category="unknown"`. This is the only time `"unknown"` appears -- successful runs always produce a real `RequestCategory` value. The API layer checks for this and converts it to an HTTP 503.
+
+**Status code choice:**
+- `200` -- Success. The agent processed the request normally.
+- `422` -- Validation error. FastAPI returns this automatically when the request body doesn't match `TriageRequest`.
+- `503` -- Service Unavailable. The orchestrator failed (LLM connection error, token limit exceeded, model unavailable). Signals a temporary issue -- the client should retry.
+
+### Layered error handling architecture
+
+With the API layer, errors are handled at three levels:
+
+```
+Layer 1: Delegate tool try/except (agents.py)
+    --> Catches classifier/specialist/escalation failures
+    --> Returns error string to orchestrator
+    --> Orchestrator continues with degraded info (graceful degradation)
+
+Layer 2: run_triage except (triage_service.py)
+    --> Catches orchestrator-level failures (OpenAI down, token limit)
+    --> Returns fallback FinalTriageResponse with category="unknown"
+
+Layer 3: API HTTPException check (api.py)
+    --> Detects fallback by checking category == "unknown"
+    --> Returns HTTP 503 with detailed error JSON
+```
+
+Each layer handles a different scope of failure. Layer 1 absorbs delegate failures so the orchestrator can continue. Layer 2 absorbs orchestrator failures so the API doesn't crash. Layer 3 translates the fallback into a proper HTTP error so the client knows what happened.
+
+**Important insight:** If only a delegate fails (e.g., Ollama is down for the classifier), Layer 1 handles it. The orchestrator adapts, produces a valid response, and the API returns HTTP 200. The client never knows a delegate failed -- the system degraded gracefully. Only when the orchestrator itself fails does the client see a 503.
+
+### Running the API
+
+```bash
+# Start the server with auto-reload for development
+uvicorn api:app --reload
+
+# Test with curl
+curl -X POST http://localhost:8000/triage \
+    -H "Content-Type: application/json" \
+    -d '{"email": "user1@gmail.com", "query": "I want a refund for order #123"}'
+
+# Interactive docs (auto-generated from Pydantic models)
+# Open in browser: http://localhost:8000/docs
+```
+
+---
+
 ## Blueprint: Create Any Agent from a Description
 
 Follow this blueprint to create a new agent for any task. This is the process a master agent should follow when building agents from a description.
@@ -1653,11 +1840,12 @@ async with summary_agent.run_stream(
 
 ```
 automated-ai-customer-support/
-├── main.py                  # Entry point, orchestration, human-in-the-loop
+├── api.py                   # FastAPI HTTP layer -- /triage, /health endpoints
+├── main.py                  # CLI entry point -- for local testing and human-in-the-loop
 ├── src/
 │   ├── agents.py            # Agent definitions, system prompts, tools, validators
 │   ├── config.py            # AppContext, model names, constants, feature flags
-│   ├── schemas.py           # Pydantic output schemas (the contract)
+│   ├── schemas.py           # Pydantic schemas (agent output + API request/response)
 │   ├── triage_service.py    # Business logic, agent orchestration, guardrails, streaming
 │   └── db.py                # Database layer (mock or real)
 ├── tests/
@@ -1670,9 +1858,10 @@ automated-ai-customer-support/
 ```
 
 The separation:
-- `schemas.py` defines WHAT agents return (`CustomerRequestResult`, `FinalTriageResponse`, `EscalationResponse`)
+- `schemas.py` defines WHAT agents return AND what the API accepts (`TriageRequest`, `FinalTriageResponse`, `EscalationResponse`). Pydantic models serve double duty -- agent output schema and API contract.
 - `agents.py` defines HOW agents work -- all 4 agents live here (classifier, specialist, escalation, orchestrator) along with their system prompts, tools, and validators
 - `triage_service.py` defines WHEN and WHY agents are called (calls the orchestrator, applies business rules, handles both standard and streaming run modes)
 - `config.py` defines configuration (models, limits, feature flags like `IS_STREAM_RESPONSE_OUTPUT`)
-- `main.py` handles user interaction, creates per-user contexts, and manages the human-in-the-loop approval flow
+- `api.py` is the HTTP interface -- receives requests, creates per-request contexts, calls `run_triage`, and translates agent failures into proper HTTP status codes
+- `main.py` is the CLI interface -- for local testing, `asyncio.gather` parallel runs, and human-in-the-loop approval
 - `tests/` verifies deterministic components (business rules, validators) without LLM calls -- fast, free, reliable
