@@ -1,9 +1,9 @@
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import StreamingResponse
 from src.db import MockDB
 from src.config import AppContext
 from src.schemas import TriageRequest, FinalTriageResponse
-from src.triage_service import run_triage_streaming
+from src.triage_service import run_triage_streaming, run_triage_stream_events
 
 """
 NOTE: FastAPI() creates the application instance
@@ -57,3 +57,12 @@ async def triage(request: TriageRequest):
 
     # FastAPI takes the FinalTriageResponse object and serializes it to JSON automatically because it's a Pydantic model.
     return result
+
+@app.post("/triage/stream")
+async def triage_stream(request: TriageRequest):
+    ctx = AppContext(db=db_instance, user_email=request.email)
+    # StreamingResponse takes an async generator and sends each yielded value to the client as it arrives, instead of buffering everything and sending it at once.
+    return StreamingResponse(
+        run_triage_stream_events(ctx, request.query),
+        media_type="text/event-stream" # tells the client "this is an SSE stream.
+    )

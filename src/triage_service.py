@@ -1,7 +1,10 @@
+from httpx import request
 from src.agents import classifier_agent, specialist_agent, orchestrator_agent
 from src.config import AppContext, SPECIALIST_REQUEST_LIMIT, SPECIALIST_TOTAL_TOKENS_LIMIT
 from src.schemas import FinalTriageResponse, RequestCategory
 from pydantic_ai import UsageLimits
+from collections.abc import AsyncIterator
+import json
 
 async def process_refunds(ctx: AppContext, order_id: str) -> str:
     """
@@ -105,3 +108,40 @@ async def run_triage_streaming(ctx: AppContext, user_query: str) -> FinalTriageR
             suggested_action="Human Intervention Required",
             customer_reply="I'm sorry, I'm unable to process your request."
         )
+
+async def run_triage_stream_events(ctx: AppContext, user_query: str) -> AsyncIterator[str]:
+    """Yields server sent events (SSE) as the orchestrator streams its response"""
+    # Instead of returning one value, it yields multiple values over time. Each yield sends one piece of data to the client.
+    # This function never print()s to the terminal for the client - it yields to the HTTP response instead.
+    try:
+        async with orchestrator_agent.run_stream(
+            user_prompt=user_query,
+            deps=ctx,
+            usage_limits=UsageLimits(
+                request_limit=SPECIALIST_REQUEST_LIMIT,
+                total_tokens_limit=SPECIALIST_TOTAL_TOKENS_LIMIT
+            )
+        ) as result:
+            async for partial_output in result.stream_output():
+                if partial_output.customer_reply:
+                    # Partial event. sent as each token arrives. The client can display these progressively.
+                    yield f"data: {json.dumps({"customer_reply": partial_output.customer_reply})}\n\n"
+
+            output = await result.get_output()
+            print(f"[Usage] Total orchestrator run - {result.usage()}")
+    
+        output = apply_business_rules(ctx, output)
+        # This is the SSE format. Server-Sent Events have a specific text format: each event starts with data: , followed by the payload, followed by two newlines
+        yield f"data: {json.dumps({'final': output.model_dump()})}\n\n"
+
+    except Exception as e:
+        print(f"Orchestrator failed: {e}")
+        error_response = FinalTriageResponse(
+            requires_human_approval=True,
+            order_id=None,
+            category="unknown",
+            suggested_action="Human Intervention Required",
+            customer_reply="I'm sorry, I'm unable to process your request."
+        )
+        # Final event sent once at the end with the complete output including business rules applied. The client knows to replace the partial display with the final result.
+        yield f"data: {json.dumps({"final": error_response.model_dump})}\n\n"
