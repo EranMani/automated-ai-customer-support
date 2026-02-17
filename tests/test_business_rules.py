@@ -20,6 +20,7 @@ from src.triage_service import apply_business_rules
     NOTE: Good tests don't just verify tricky cases -- they also guard the happy path against future changes
     NOTE: Run this in terminal - python -m pytest tests/test_business_rules.py -v
     NOTE: Good tests come in pairs -- one where the LLM gets it right, one where it gets it wrong, verifying that business rules fix the wrong cases without breaking the correct ones
+    NOTE: When a function transforms data, test both what changed and what should NOT have changed
 """
 
 
@@ -115,3 +116,50 @@ def test_general_query_llm_sets_approval_true(ctx):
     )
     result = apply_business_rules(ctx, output)
     assert result.requires_human_approval is False
+
+# NOTE: this test verifies that the business rules preserve the LLM's decision when the category is TECHNICAL_SUPPORT and the order_id exists
+def test_tech_support_with_existing_order_preserves_llm_decision(ctx):
+    """For non-refund categories with a valid order, the LLM's decision stands."""
+    output = FinalTriageResponse(
+        requires_human_approval=False,
+        order_id="#123",
+        category=RequestCategory.TECHNICAL_SUPPORT,
+        suggested_action="Help with technical issue",
+        customer_reply="Let me help you with that."
+    )
+    result = apply_business_rules(ctx, output)
+    assert result.requires_human_approval is False
+
+# NOTE: this test verifies that the business rules set requires_human_approval to False when the category is TECHNICAL_SUPPORT and the order_id does not exist
+def test_tech_support_with_nonexistent_order(ctx):
+    """Tech support referencing a non-existent order -- approval blocked."""
+    output = FinalTriageResponse(
+        requires_human_approval=True,
+        order_id="#999",
+        category=RequestCategory.TECHNICAL_SUPPORT,
+        suggested_action="Investigate order issue",
+        customer_reply="I'll look into that order."
+    )
+    result = apply_business_rules(ctx, output)
+    assert result.requires_human_approval is False
+
+# NOTE: this test checks data integrity since apply_business_rules returns a new final triage response object
+# The only value that should change is requires_human_approval
+def test_other_fields_preserved(ctx):
+    """Business rules should only change requires_human_approval, not other fields."""
+    output = FinalTriageResponse(
+        requires_human_approval=False,
+        order_id="#123",
+        category=RequestCategory.REFUND,
+        suggested_action="Process the refund immediately",
+        customer_reply="Your refund for order #123 is confirmed."
+    )
+    result = apply_business_rules(ctx, output)
+
+    # Approval changed by business rule
+    assert result.requires_human_approval is True
+    # Everything else preserved exactly
+    assert result.order_id == "#123"
+    assert result.category == RequestCategory.REFUND
+    assert result.suggested_action == "Process the refund immediately"
+    assert result.customer_reply == "Your refund for order #123 is confirmed."
