@@ -18,6 +18,7 @@ class RequestCategory(str, Enum):
     REFUND = "refund"
     TECHNICAL_SUPPORT = "technical_support"
     GENERAL_QUERY = "general_query"
+    UNKNOWN = "unknown"
 
 class CustomerRequestResult(BaseModel):
     """The result of the customer request classification"""

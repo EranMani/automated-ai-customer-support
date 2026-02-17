@@ -51,7 +51,7 @@ async def triage(request: TriageRequest):
             detail={
                 "error": "Service temporarily unavailable. Please try again later.",
                 "message": result.customer_reply,
-                "suggested_actions": result.suggested_actions,
+                "suggested_action": result.suggested_action,
             }
         )
 
