@@ -17,6 +17,7 @@ from src.agents import validate_specialist_output, validate_escalation, validate
 NOTE: Pydantic BaseModel objects support equality comparison by default - two instances are equal if all their field values match
 NOTE: the validator is just a regular Python function. The function doesn't know or care who called it
 NOTE: pytest.raises() is a way to test that a function raises an exception.
+NOTE: Test one thing at a time. Each test isolates exactly one validation rule. If a test fails, you know exactly which rule broke.
 """
 
 # NOTE: Creates a fake object that looks enough like RunContext for our validators to work
@@ -56,5 +57,18 @@ def test_specialist_rejects_short_customer_reply(mock_ctx: MagicMock):
 
     # This is how we test that a function raises an exception
     # I expect the code inside this block to raise a ModelRetry exception. If it does, the test passes. If it doesn't raise, the test fails.
+    with pytest.raises(ModelRetry):
+        validate_specialist_output(mock_ctx, output)
+
+# NOTE: This test checks the other rejection case in the specialist validator - vague suggested_action
+def test_specialist_rejects_vague_suggested_action(mock_ctx):
+    """suggested_action shorter than 5 characters should trigger ModelRetry."""
+    output = FinalTriageResponse(
+        requires_human_approval=False,
+        order_id="#123",
+        category=RequestCategory.REFUND,
+        suggested_action="Help",
+        customer_reply="We're looking into your refund request for order #123 and will get back to you shortly."
+    )
     with pytest.raises(ModelRetry):
         validate_specialist_output(mock_ctx, output)
