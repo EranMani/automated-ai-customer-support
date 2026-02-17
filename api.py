@@ -1,4 +1,5 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from src.db import MockDB
 from src.config import AppContext
 from src.schemas import TriageRequest, FinalTriageResponse
@@ -12,7 +13,14 @@ NOTE: POST is for sending data to be processed
 NOTE: response_model=FinalTriageResponse - tells FastAPI "the response will be a FinalTriageResponse
 NOTE: The ASGI server handles concurrency automatically
 NOTE: Each await is a yield point where the event loop can do other work.
+NOTE: HTTPException is FastAPI's way of returning error responses with specific status codes
+NOTE: JSONResponse lets you build custom JSON responses with any status code.
+NOTE: Other status code:
+        500 -- Internal Server Error (generic "something broke")
+        502 -- Bad Gateway (if you're proxying to another service)
+        503 -- Service Unavailable (temporary, try again) -- best fit here
 """
+
 app = FastAPI(
     title="Automated AI Customer Support API",
     description="Multi-agent customer support system powered by Pydantic AI"
@@ -35,5 +43,17 @@ async def triage(request: TriageRequest):
     # Using await is critical. This is an async function, and run_triage is async
     # While the LLM is processing, the event loop is free to handle other incoming requests
     result = await run_triage_streaming(ctx, request.query)
+
+    # Detect when the LLM returns an unknown category and return a custom error response
+    if result.category == "unknown":
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "Service temporarily unavailable. Please try again later.",
+                "message": result.customer_reply,
+                "suggested_actions": result.suggested_actions,
+            }
+        )
+
     # FastAPI takes the FinalTriageResponse object and serializes it to JSON automatically because it's a Pydantic model.
     return result
