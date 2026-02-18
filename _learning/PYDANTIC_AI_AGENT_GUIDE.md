@@ -24,7 +24,8 @@ This document was created from real engineering decisions made while building an
 15. [Common Mistakes to Avoid](#common-mistakes-to-avoid)
 16. [Testing Agent Systems](#testing-agent-systems)
 17. [API Layer with FastAPI](#api-layer-with-fastapi)
-18. [Blueprint: Create Any Agent from a Description](#blueprint-create-any-agent-from-a-description)
+18. [Interactive UI with NiceGUI](#interactive-ui-with-nicegui)
+19. [Blueprint: Create Any Agent from a Description](#blueprint-create-any-agent-from-a-description)
 
 ---
 
@@ -48,7 +49,7 @@ These principles govern every design decision in this codebase:
 
 ## Architecture Overview
 
-This project uses an **agent delegation** pattern behind an HTTP API. An orchestrator agent is the brain that decides which specialist agents to call. Python code enforces business rules on the final output. FastAPI serves the HTTP layer.
+This project uses an **agent delegation** pattern with three entry points: an HTTP API (FastAPI), a browser UI (NiceGUI), and a CLI (main.py). All three share the same service layer. An orchestrator agent is the brain that decides which specialist agents to call. Python code enforces business rules on the final output.
 
 ```
 HTTP POST /triage {"email": "...", "query": "..."}
@@ -1901,6 +1902,172 @@ curl -X POST http://localhost:8000/triage/stream \
 
 ---
 
+## Interactive UI with NiceGUI
+
+The project has three entry points that all share the same core service layer:
+
+| Entry point | Purpose | How to run |
+|---|---|---|
+| `main.py` | CLI batch testing, human-in-the-loop approval | `python main.py` |
+| `api.py` | HTTP API (standard + streaming endpoints) | `uvicorn api:app --reload` |
+| `ui.py` | Interactive browser UI | `python ui.py` |
+
+All three call the same `run_triage_stream_events` generator from `triage_service.py`. No business logic is duplicated.
+
+### Why NiceGUI
+
+NiceGUI is a Python-first web UI framework. You write the entire UI in Python -- no HTML, no JavaScript, no separate frontend build step. It runs a FastAPI server internally and communicates with the browser via WebSocket. This makes it the natural choice for wrapping a Python AI agent in an interactive demo.
+
+Key fit with this project:
+- Natively async -- NiceGUI's `async def` event handlers work directly with `await` and `async for`, so consuming the async generator from `run_triage_stream_events` requires zero adaptation
+- No frontend build -- the entire UI is `ui.py`, one file
+- Component library covers everything needed: inputs, cards, badges, logs, progress indicators
+
+### Install
+
+```bash
+uv add nicegui
+```
+
+### UI architecture
+
+The page has five visible areas, all hidden by default and revealed progressively as events arrive:
+
+```
+[Header]
+
+[Input Card]
+    Email input | Query textarea    (side by side, same height)
+    [Run Agent] button
+
+[Status Label]                      ← updates from "status" tool events only
+                                      e.g. "⚙ Classifying your request..."
+
+[Customer Reply Card]               ← hidden until "final" event arrives
+    Full reply text
+
+[Triage Result Card]                ← hidden until "final" event arrives
+    Category badge (color-coded)
+    Human Approval badge
+    Order ID
+    Suggested Action
+
+[Raw Event Log]                     ← collapsible, shows raw SSE strings
+```
+
+### Parsing SSE events in the UI
+
+The `run_triage_stream_events` generator yields raw SSE-formatted strings. The UI strips the `data: ` prefix and parses the JSON:
+
+```python
+def parse_sse_event(raw: str) -> dict | None:
+    """Strip the SSE 'data: ' prefix and parse the JSON payload."""
+    line = raw.strip()
+    if line.startswith("data: "):
+        try:
+            return json.loads(line[6:])
+        except json.JSONDecodeError:
+            return None
+    return None
+```
+
+This is the same parsing any SSE client would do (browser `EventSource`, curl, etc.). The `[6:]` slice removes the 6-character `data: ` prefix.
+
+### The submit handler -- three event types, three behaviors
+
+```python
+async def on_submit():
+    ctx = AppContext(db=db_instance, user_email=email)
+
+    async for raw_event in run_triage_stream_events(ctx, query):
+        log.push(raw_event.strip())       # Always push to raw log
+        payload = parse_sse_event(raw_event)
+        if payload is None:
+            continue
+
+        if "status" in payload:
+            # Tool callback events -- update the status label progressively
+            # These arrive during the tool call phase (classify, lookup, escalate)
+            status_label.set_text(f"⚙ {payload['status']}")
+
+        elif "customer_reply" in payload:
+            # Partial token events -- silently accumulate, don't show yet
+            # The reply card stays hidden; we wait for the complete final text
+            pass
+
+        elif "final" in payload:
+            final = payload["final"]
+
+            # Reveal reply card with completed text
+            reply_label.set_text(final.get("customer_reply", ""))
+            reply_card.classes(remove="hidden")
+
+            # Populate and reveal result card
+            category = final.get("category", "unknown")
+            category_val.set_text(category.replace("_", " ").title())
+            # ... badges, order id, suggested action ...
+            result_card.classes(remove="hidden")
+
+            # Final status
+            status_label.set_text("✓ Done")
+```
+
+**Why ignore `customer_reply` partial events?** The `customer_reply` tokens stream in during the short window after all tool calls complete. Because the orchestrator front-loads all its work (tool calls) before streaming the final output, the partial outputs arrive in a burst and are almost immediately followed by `final`. Waiting for `final` gives a clean, complete reply rather than a flickering partial text. If you were streaming a long free-text response (not structured output), streaming partials to the user would make more sense.
+
+### Keeping reply and result cards hidden until done
+
+On each new submission, both cards are explicitly hidden before the agent runs:
+
+```python
+# Reset on every new submission
+reply_card.classes(add="hidden")
+result_card.classes(add="hidden")
+status_label.set_text("⚙ Starting agent...")
+```
+
+They are only revealed inside the `elif "final"` branch. This means the user never sees a stale result from the previous run while the new one is loading.
+
+### Status label color transitions
+
+The status label starts as slate (neutral), and turns green when done:
+
+```python
+# While running: slate gray
+status_label.classes("text-slate-400")
+status_label.set_text("⚙ Starting agent...")
+
+# On final event: green
+status_label.classes(remove="text-slate-400")
+status_label.classes("text-green-400")
+status_label.set_text("✓ Done")
+```
+
+`classes(remove="...")` and `classes("...")` are NiceGUI's way to toggle Tailwind classes at runtime. The pattern is: remove the old color class first, then add the new one.
+
+### Category color coding
+
+Each `RequestCategory` value maps to a distinct badge color so the result is scannable at a glance:
+
+```python
+CATEGORY_COLORS = {
+    "refund": "#f97316",           # orange -- high-stakes, needs attention
+    "technical_support": "#3b82f6", # blue -- informational
+    "general_query": "#22c55e",    # green -- low priority
+    "unknown": "#ef4444",          # red -- agent failure
+}
+```
+
+### Running the UI
+
+```bash
+python ui.py
+# Opens at http://localhost:8080
+```
+
+The UI runs on port 8080 to avoid colliding with the FastAPI server on port 8000. Both can run simultaneously -- they're independent servers that happen to share the same Python service layer.
+
+---
+
 ## Blueprint: Create Any Agent from a Description
 
 Follow this blueprint to create a new agent for any task. This is the process a master agent should follow when building agents from a description.
@@ -2046,6 +2213,18 @@ async with summary_agent.run_stream(
 - [ ] `StreamingResponse` with `media_type="text/event-stream"` in the FastAPI endpoint
 - [ ] Tested with `curl -N` (not Swagger UI, which doesn't handle SSE properly)
 
+### Additional checklist for NiceGUI UI
+
+- [ ] `parse_sse_event()` helper strips `data: ` prefix and parses JSON from each generator yield
+- [ ] `status` events update the status label only (tool call progress feedback during the slow phase)
+- [ ] `customer_reply` partial events are silently ignored -- UI waits for `final` to show complete text
+- [ ] `final` event reveals both the reply card and result card simultaneously
+- [ ] Both cards are explicitly hidden (`classes(add="hidden")`) at the start of every new submission
+- [ ] Status label color transitions: slate (running) → green (done) via `classes(remove=...)` + `classes(...)`
+- [ ] Category badges are color-coded: orange (refund), blue (technical), green (general), red (unknown)
+- [ ] Raw event log at the bottom receives every event via `log.push()` for debugging
+- [ ] UI runs on a different port (8080) than the FastAPI server (8000) to avoid conflicts
+
 ---
 
 ## File Structure Reference
@@ -2054,6 +2233,7 @@ async with summary_agent.run_stream(
 automated-ai-customer-support/
 ├── api.py                   # FastAPI HTTP layer -- /triage, /triage/stream, /health endpoints
 ├── main.py                  # CLI entry point -- for local testing and human-in-the-loop
+├── ui.py                    # NiceGUI interactive browser UI -- real-time agent output display
 ├── src/
 │   ├── agents.py            # Agent definitions, system prompts, tools, validators
 │   ├── config.py            # AppContext, model names, constants, feature flags
@@ -2076,4 +2256,5 @@ The separation:
 - `config.py` defines configuration (models, limits, feature flags like `IS_STREAM_RESPONSE_OUTPUT`)
 - `api.py` is the HTTP interface -- receives requests, creates per-request contexts, calls `run_triage` or `run_triage_stream_events`, and translates agent failures into proper HTTP status codes. Includes both standard JSON endpoint and SSE streaming endpoint
 - `main.py` is the CLI interface -- for local testing, `asyncio.gather` parallel runs, and human-in-the-loop approval
+- `ui.py` is the NiceGUI browser UI -- consumes `run_triage_stream_events` directly, displays status events as live progress and the final response once complete
 - `tests/` verifies deterministic components (business rules, validators) without LLM calls -- fast, free, reliable
