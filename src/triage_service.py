@@ -36,7 +36,10 @@ def apply_business_rules(ctx: AppContext, output: FinalTriageResponse) -> FinalT
         try:
             ctx.db.get_order_status(output.order_id)
         except KeyError:
-            requires_human_approval = False
+            # Non-existent order: no action possible for non-refund requests
+            # But for refunds, a human should investigate the invalid order number
+            if output.category != RequestCategory.REFUND:
+                requires_human_approval = False
 
     # Business rule: no order = nothing to approve
     if output.order_id is None:
