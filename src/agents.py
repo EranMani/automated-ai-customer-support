@@ -27,6 +27,8 @@ NOTE: The orchestrator agent comes with few things that might bite:
        We need a detailed logging inside each delegate tool.
 NOTE: tools are just text in, text out from the orchestrator's perspective. The orchestrator LLM doesn't know or care whether the tool ran a delegate agent, queried a database, or failed entirely
       It just reads the returned string and reasons about it. That's why the error messages matter -- they're instructions to the orchestrator about what to do next.
+NOTE: The tools can't yield -- they're regular async functions, not generators. The generator can't see inside the tools -- it just waits for run_stream() to finish its tool calls.
+NOTE: how does Place A talk to Place B? Through a callback. Place B creates a function and hands it to Place A via AppContext. When Place A wants to send a status update, it calls that function. The function puts the message somewhere Place B can pick it up
 """
 
 from pydantic_ai import Agent, RunContext, PromptedOutput, ModelRetry
@@ -168,6 +170,8 @@ def orchestrator_prompt(ctx: RunContext[AppContext]) -> str:
 @orchestrator_agent.tool
 async def classify_request(ctx: RunContext[AppContext], customr_message: str) -> str:
     """Classify the customer's message into a category: refund, technical_support, or general_query."""
+    if ctx.deps.on_status:
+        await ctx.deps.on_status("Classifying request...")
     # NOTE: Handle any errors that might happen when running the classifier agent
     try:
         result = await classifier_agent.run(
@@ -183,6 +187,8 @@ async def classify_request(ctx: RunContext[AppContext], customr_message: str) ->
 @orchestrator_agent.tool
 async def handle_support_request(ctx: RunContext[AppContext], customer_message: str) -> str:
     """Handle a complex customer support request with database lookups and detailed analysis."""
+    if ctx.deps.on_status:
+        await ctx.deps.on_status("Looking up your account and order details...")
     try:
         result = await specialist_agent.run(
             user_prompt=customer_message,
@@ -197,6 +203,8 @@ async def handle_support_request(ctx: RunContext[AppContext], customer_message: 
 @orchestrator_agent.tool
 async def escalate_to_manager(ctx: RunContext[AppContext], customer_message: str, reason: str) -> str:
     """Escalate a high-risk case to a human manager. Use for refunds, security issues, or account modifications."""
+    if ctx.deps.on_status:
+        await ctx.deps.on_status("Escalating to a senior representative...")
     try:
         result = await escalation_agent.run(
             user_prompt=f"Customer message: {customer_message}\nEscalation reason: {reason}",
