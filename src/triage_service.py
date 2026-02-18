@@ -1,3 +1,4 @@
+import asyncio
 from httpx import request
 from src.agents import classifier_agent, specialist_agent, orchestrator_agent
 from src.config import AppContext, SPECIALIST_REQUEST_LIMIT, SPECIALIST_TOTAL_TOKENS_LIMIT
@@ -113,16 +114,34 @@ async def run_triage_stream_events(ctx: AppContext, user_query: str) -> AsyncIte
     """Yields server sent events (SSE) as the orchestrator streams its response"""
     # Instead of returning one value, it yields multiple values over time. Each yield sends one piece of data to the client.
     # This function never print()s to the terminal for the client - it yields to the HTTP response instead.
+
+    # Create an async queue to bridge between tool callbacks and the SSE generator
+    status_queue: asyncio.Queue[str] = asyncio.Queue()
+
+    async def emit_status(message: str):
+        await status_queue.put(f"data: {json.dumps({'status': message})}\n\n")
+
+    # Pass the emit_status function as the on_status callable
+    stream_ctx = AppContext(db=ctx.db, user_email=ctx.user_email, on_status=emit_status)
+
     try:
         async with orchestrator_agent.run_stream(
             user_prompt=user_query,
-            deps=ctx,
+            deps=stream_ctx,
             usage_limits=UsageLimits(
                 request_limit=SPECIALIST_REQUEST_LIMIT,
                 total_tokens_limit=SPECIALIST_TOTAL_TOKENS_LIMIT
             )
         ) as result:
+            # DRAIN: yield any status events that arrived during tool calls
+            while not status_queue.empty():
+                yield await status_queue.get()
+
             async for partial_output in result.stream_output():
+                # DRAIN: check for new status events between each partial output
+                while not status_queue.empty():
+                    yield await status_queue.get()
+                    
                 if partial_output.customer_reply:
                     # Partial event. sent as each token arrives. The client can display these progressively.
                     yield f"data: {json.dumps({"customer_reply": partial_output.customer_reply})}\n\n"
@@ -144,4 +163,4 @@ async def run_triage_stream_events(ctx: AppContext, user_query: str) -> AsyncIte
             customer_reply="I'm sorry, I'm unable to process your request."
         )
         # Final event sent once at the end with the complete output including business rules applied. The client knows to replace the partial display with the final result.
-        yield f"data: {json.dumps({"final": error_response.model_dump})}\n\n"
+        yield f"data: {json.dumps({'final': error_response.model_dump()})}\n\n"
