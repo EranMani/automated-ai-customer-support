@@ -25,7 +25,9 @@ This document was created from real engineering decisions made while building an
 16. [Testing Agent Systems](#testing-agent-systems)
 17. [API Layer with FastAPI](#api-layer-with-fastapi)
 18. [Interactive UI with NiceGUI](#interactive-ui-with-nicegui)
-19. [Blueprint: Create Any Agent from a Description](#blueprint-create-any-agent-from-a-description)
+19. [Structured Logging](#structured-logging)
+20. [Interview Prep](#interview-prep)
+21. [Blueprint: Create Any Agent from a Description](#blueprint-create-any-agent-from-a-description)
 
 ---
 
@@ -44,6 +46,22 @@ These principles govern every design decision in this codebase:
 5. **Co-locate agent capabilities.** An agent's system prompt, tools, and output validator should live together in one place. Anyone reading the code should understand the agent's full capability set at a glance.
 
 6. **Let agents delegate, let Python override.** An orchestrator agent decides which specialist agents to call. But business rules (refund approval, order validation) are always enforced by Python code on the final output, never left to the LLM's judgment.
+
+### Why Pydantic AI?
+
+This project uses Pydantic AI over alternatives (LangChain, LlamaIndex, raw OpenAI SDK). The reasons:
+
+| Consideration | Pydantic AI | LangChain |
+|---|---|---|
+| Structured output | Native `BaseModel` -- same class you already know | Custom "output parsers" on top of strings |
+| Dependency injection | `RunContext[AppContext]` -- typed, IDE-autocomplete | Callback system -- harder to trace statically |
+| Abstraction level | Thin -- wraps the model API, little else | Heavy -- chains, runnables, LCEL, callbacks |
+| Debugging | Read the source in minutes | Multiple library files between your code and the API |
+| Learning curve | If you know Pydantic, you know 80% of this | Separate framework vocabulary to learn |
+
+The core argument: in production, you need to understand exactly what your code does at every step. LangChain's abstraction layers make debugging harder. Pydantic AI gives you type-safe structured output -- a Pydantic `BaseModel` is the output contract -- without requiring you to learn a new paradigm on top of Python.
+
+This doesn't mean LangChain is bad. For rapid prototyping, pre-built chains, or teams already invested in LangChain's ecosystem, it's a valid choice. For a greenfield project where control and debuggability matter most, Pydantic AI is the better fit.
 
 ---
 
@@ -193,6 +211,32 @@ Parameters explained:
 - `deps_type`: The type of the dependency context. Enables type-safe access in system prompts and tools
 - `retries`: How many times the agent can retry when the output validator raises `ModelRetry`
 - Use `PromptedOutput(SchemaClass)` for models that work better with prompted JSON output (like local Ollama models)
+
+### `PromptedOutput` vs plain schema: why Ollama needs it
+
+OpenAI models support the **function calling API** natively. When you pass `output_type=FinalTriageResponse`, Pydantic AI sends the JSON schema to OpenAI using the structured output / function-calling protocol. The model is specifically trained to follow this protocol and return valid JSON matching the schema.
+
+Local models (Ollama `llama3.2`) are smaller and may not reliably implement the function-calling protocol. If you pass `output_type=CustomerRequestResult` directly to an Ollama agent, the model may return plain text instead of JSON, or JSON with wrong field names, causing validation errors.
+
+`PromptedOutput(CustomerRequestResult)` is the fix:
+
+```python
+# For cloud models: native function-calling protocol
+classifier_agent = Agent(
+    model="ollama:llama3.2",
+    output_type=PromptedOutput(CustomerRequestResult),  # Wrap for local models
+)
+
+# For cloud models: native structured output, no wrapper needed
+orchestrator_agent = Agent(
+    model="openai:gpt-4.1-mini",
+    output_type=FinalTriageResponse,  # Direct, no wrapper
+)
+```
+
+`PromptedOutput` converts the JSON schema into instructions that appear in the system prompt: `"You must respond with a JSON object matching this schema: {schema}"`. Instead of relying on function-calling training, the model is just told to produce JSON. Most models -- even small ones -- can follow this instruction reliably.
+
+**Rule**: always try without `PromptedOutput` first. If you get validation errors or non-JSON responses from a local model, wrap the output type with `PromptedOutput`.
 
 ### Step 4: Add a Dynamic System Prompt
 
@@ -475,6 +519,17 @@ But this mixes data with the user's message. Dependency injection keeps them sep
 - The user prompt stays exactly what the user said -- no data injection, no formatting hacks
 - Tools access the DB through `ctx.deps` -- no globals, no module-level state
 
+### Why `dataclass` for AppContext instead of Pydantic `BaseModel`?
+
+`AppContext` is defined with `@dataclass`, not `class AppContext(BaseModel)`. This is intentional:
+
+- **`BaseModel`** is for data that comes from outside your code (HTTP requests, LLM output, JSON files). It validates and coerces values because you can't trust external input.
+- **`dataclass`** is for internal data structures that your own trusted code creates and controls. It's a lightweight container with no validation overhead.
+
+`AppContext` is always created by your Python code (`AppContext(db=db_instance, user_email=email)`). The database instance and the email string are set by code you control. There is nothing to validate. Adding Pydantic validation here would add overhead with zero safety benefit.
+
+**The rule**: if data arrives from the outside world, use `BaseModel`. If data is created by your own code, use `dataclass`.
+
 ---
 
 ## Dynamic System Prompts
@@ -625,6 +680,37 @@ Do NOT use `ModelRetry` for business rule violations. If the LLM sets `requires_
 | Output violates a business rule | Deterministic override in application code | Only your code knows the business rule; the model can't reliably enforce it |
 | Output has wrong format | `ModelRetry` in output validator | The model CAN fix formatting when given specific feedback |
 | Output contains a factual claim you can verify | Deterministic check in application code | Don't ask the model to verify facts -- check your database yourself |
+| LLM writes a response inconsistent with a DB lookup result | Deterministic override in application code | The LLM will re-extract the same data from the user's message on every retry |
+
+### Deep dive: The ModelRetry exhaustion trap
+
+A `ModelRetry` loop will exhaust all retries (silently crashing the run) if the feedback message does not instruct the LLM to change the **specific field** that keeps triggering the rejection.
+
+**The scenario that exposed this:** A customer asks for a refund on order `#99990`, which doesn't exist in the database. The orchestrator validator detects this and raises `ModelRetry` telling the LLM to acknowledge the order doesn't exist. On every retry, the LLM still sets `order_id="#99990"` -- because that's what the user said, and the schema says "include the order ID if the request is related to one." The validator fires again. After `MAX_RETRIES` attempts, Pydantic AI raises an exception, the outer `except` catches it, and the hardcoded fallback message appears: `"I'm sorry, I'm unable to process your request."` -- not the helpful "order not found" message you wanted.
+
+```
+ModelRetry fires: "order #99990 not found, update customer_reply"
+  ↓
+LLM retries -- still sets order_id="#99990" (it's in the user's message)
+  ↓
+Validator fires again for the same reason
+  ↓
+After MAX_RETRIES=3: Pydantic AI raises UnexpectedModelBehavior
+  ↓
+except Exception catches it → hardcoded fallback fires
+  ↓
+Customer sees: "I'm sorry, I'm unable to process your request."
+```
+
+**Why does this happen?** The LLM has two instructions that conflict:
+1. Your `ModelRetry` message: "set order_id to null"
+2. The schema field description: "The order ID related to the customer's request, if applicable"
+
+The user explicitly mentioned `#99990` in their message. The LLM correctly determines "this request IS related to order #99990" and keeps including it -- following the schema description, which it treats as a structural contract. Your retry instruction conflicts with the schema, and the schema wins.
+
+**The rule:** `ModelRetry` works when you are asking the LLM to **improve output quality** (write more, be more specific, change tone). It fails when you are asking the LLM to **contradict data it correctly extracted from the user's message**. For the second case, use a deterministic override after the agent returns.
+
+**How to detect you're in this trap:** If you see the hardcoded fallback message (`"I'm sorry, I'm unable to process your request."`) when you expected a specific message from your validator, the retry loop has exhausted. Check your logs: `logger.error("Orchestrator failed: ...")` will show the `UnexpectedModelBehavior` or `UsageLimitExceeded` exception that triggered the fallback.
 
 ---
 
@@ -643,13 +729,21 @@ requires_human_approval = output.requires_human_approval
 if output.category == RequestCategory.REFUND:
     requires_human_approval = True
 
-# Business rule: verify the order actually exists in our system
+# Business rule: if the order doesn't exist, override the entire response
+# The LLM hallucinated a response implying the order is real -- Python corrects it
 if output.order_id is not None:
     try:
         ctx.db.get_order_status(output.order_id)
     except KeyError:
-        # Order doesn't exist in DB -- nothing to approve
-        requires_human_approval = False
+        # Early return: the order doesn't exist, override customer_reply entirely
+        return FinalTriageResponse(
+            requires_human_approval=False,
+            order_id=output.order_id,   # keep for logging -- shows what was attempted
+            category=output.category,
+            suggested_action="Order not found. Ask customer to verify order number.",
+            customer_reply=f"We couldn't find order {output.order_id} in our system — "
+                           "please double-check your order number and contact us if you need help."
+        )
 
 # Business rule: no order = nothing to approve
 if output.order_id is None:
@@ -659,11 +753,27 @@ if output.order_id is None:
 ### The principle
 
 Don't ask the LLM to tell you something you can verify yourself:
-- The LLM says "order #999 needs a refund" --> You check the database: #999 doesn't exist --> Override to False
-- The LLM says "no approval needed" for a refund --> Your business rule says refunds always need approval --> Override to True
+- The LLM says "order #999 needs a refund" --> You check the database: #999 doesn't exist --> Override the entire response with "order not found" message
+- The LLM says "no approval needed" for a refund --> Your business rule says refunds always need approval --> Override `requires_human_approval = True`
 
 **LLM provides**: intent interpretation, natural language responses, entity extraction
 **Python enforces**: business rules, data validation, access control
+
+### Why the non-existent order rule returns early (not just sets a flag)
+
+The initial implementation of the non-existent order rule only set `requires_human_approval = False`. This had a subtle bug: for a **refund request** on a non-existent order, the rule execution order was:
+
+```
+Rule 1: category == REFUND  →  requires_human_approval = True
+Rule 2: order #99990 not found  →  requires_human_approval = False  (overwrites Rule 1!)
+Final: requires_human_approval = False  ← wrong
+```
+
+The last rule to write the flag wins. This made a refund request on a non-existent order appear to not need human approval, which is the opposite of safe behavior.
+
+The fix is to return a complete new `FinalTriageResponse` early when an order doesn't exist -- not just flip a flag. This also fixes a second problem: the LLM's `customer_reply` was hallucinating ("our billing team is reviewing it") despite the specialist's DB tool returning "Order ID could not be found." An early return lets Python write the exact reply the customer should see, bypassing the LLM's hallucination entirely.
+
+The `order_id` is preserved in the override response so logs show what order number was attempted. This is important for debugging and audit trails.
 
 ### Why business rules go AFTER the agent, not inside it
 
@@ -718,12 +828,19 @@ def apply_business_rules(ctx: AppContext, output: FinalTriageResponse) -> FinalT
     if output.category == RequestCategory.REFUND:
         requires_human_approval = True
 
-    # Business rule: verify the order actually exists in the system
+    # Business rule: if the order doesn't exist, override the response entirely
     if output.order_id is not None:
         try:
             ctx.db.get_order_status(output.order_id)
         except KeyError:
-            requires_human_approval = False
+            return FinalTriageResponse(
+                requires_human_approval=False,
+                order_id=output.order_id,
+                category=output.category,
+                suggested_action="Order not found. Ask customer to verify order number.",
+                customer_reply=f"We couldn't find order {output.order_id} in our system — "
+                               "please double-check your order number and contact us if you need help."
+            )
 
     # Business rule: no order = nothing to approve
     if output.order_id is None:
@@ -1431,11 +1548,27 @@ Always verify your model name is valid. Use `result.usage()` to check for unexpe
 **Wrong**: Creating fallback `FinalTriageResponse(requires_human_approval=True, order_id=None, ...)` without all required fields. If you add a new field like `category` to the schema, every manual constructor in fallback/exception paths will fail with `ValidationError: category Field required`.
 **Right**: When adding new required fields to output schemas, search for every manual constructor of that model (especially in `except` blocks) and add the new field with a sensible default like `category="unknown"`.
 
-### 16. Creating a callback queue but never draining it
+### 16. Using `print()` instead of `logging`
+**Wrong**: Scattered `print()` calls throughout service code for debugging and operational events.
+**Right**: Use `logging` with severity levels (`INFO`, `WARNING`, `ERROR`). Create a shared `get_logger(__name__)` factory in `src/logger.py`. Keep `print()` only for intentional CLI output (user-facing text in `main.py`).
+
+### 17. Putting structured data in `extra={}` with a standard formatter
+**Wrong**: `logger.info("Run complete", extra={"tokens": 222})` -- the `extra` dict is attached to the log record but invisible in the output because the standard format string `%(asctime)s - %(name)s - %(levelname)s - %(message)s` doesn't reference custom field names.
+**Right**: Embed the data directly in the message: `logger.info(f"Run complete | tokens={usage.output_tokens} | category={output.category.value}")`.
+
+### 18. Using ModelRetry when the LLM will re-extract the same data on every retry
+**Wrong**: Raising `ModelRetry` in a validator when the rejection is triggered by a field the LLM correctly extracted from the user's message. Example: user says "refund order #99990", LLM sets `order_id="#99990"`, validator checks DB and rejects because the order doesn't exist, ModelRetry tells LLM to set `order_id` to null. The LLM ignores this -- the user mentioned the order, the schema says to include it, and the schema wins. Every retry fails, retries are exhausted, the fallback fires.
+**Right**: Use a deterministic override in `apply_business_rules`. When Python checks the DB and the order doesn't exist, return a new `FinalTriageResponse` with the correct `customer_reply` directly. No LLM negotiation needed.
+
+### 19. Business rules that blindly overwrite each other (last-writer-wins bug)
+**Wrong**: Sequential flag assignments where a later rule can silently undo an earlier one. Example: Rule 1 sets `requires_human_approval = True` for refunds. Rule 2 sets `requires_human_approval = False` for non-existent orders. For a refund on a non-existent order, Rule 2 undoes Rule 1, and the refund gets no human review.
+**Right**: Make rules category-aware, or use an early return when a rule produces a complete answer. If an order doesn't exist, return the entire override `FinalTriageResponse` immediately rather than just setting a flag that a subsequent rule might overwrite.
+
+### 21. Creating a callback queue but never draining it
 **Wrong**: Creating an `asyncio.Queue` and an `emit_status` callback, storing it in `AppContext`, but never reading from the queue in the generator. Status messages pile up in the queue and never reach the client.
 **Right**: Add `while not status_queue.empty(): yield await status_queue.get()` at every yield point in the generator -- both before and inside the `async for partial_output` loop.
 
-### 17. Calling `model_dump` without parentheses
+### 22. Calling `model_dump` without parentheses
 **Wrong**: `error_response.model_dump` -- references the method object itself, which serializes to something like `<bound method BaseModel.model_dump>`.
 **Right**: `error_response.model_dump()` -- calls the method and returns the actual dictionary.
 
@@ -2068,6 +2201,289 @@ The UI runs on port 8080 to avoid colliding with the FastAPI server on port 8000
 
 ---
 
+## Structured Logging
+
+`print()` is a one-way street -- text goes to the terminal and disappears. Python's `logging` module gives you severity levels, timestamps, per-module filtering, and file output with zero extra dependencies.
+
+| Feature | `print()` | `logging` |
+|---|---|---|
+| Severity levels | None -- all equal | DEBUG / INFO / WARNING / ERROR |
+| Timestamps | No | Yes, automatic |
+| Filter by severity | No | Yes -- set `INFO` in prod, `DEBUG` in dev |
+| Per-module control | No | Yes -- silence noisy third-party libraries |
+| File output | No | Yes, can write to `.log` files |
+
+### Setup: one shared logger factory
+
+Create `src/logger.py` as the single place where logging is configured. Every other file imports from here:
+
+```python
+import logging
+import sys
+
+def get_logger(name: str) -> logging.Logger:
+    """Get a logger with a specific name."""
+    logger = logging.getLogger(name)
+
+    # Prevent adding duplicate handlers if get_logger is called multiple times
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        formatter = logging.Formatter(
+            fmt='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+
+    return logger
+```
+
+The `if not logger.handlers:` guard is important. Python's `logging` module caches logger instances by name -- calling `logging.getLogger("src.triage_service")` twice returns the same object. Without the guard, each call to `get_logger` would add another handler to the same logger, and every log line would print twice (or more).
+
+### Using the logger in each file
+
+```python
+from src.logger import get_logger
+
+logger = get_logger(__name__)
+```
+
+`__name__` is a Python built-in that equals the current module's fully-qualified name (e.g. `src.triage_service`, `api`). Every log line will identify exactly which file it came from:
+
+```
+2026-02-18 10:06:21 - src.triage_service - INFO - Orchestrator run complete | ...
+2026-02-18 10:06:22 - api - INFO - Triage request received | email=user1@gmail.com
+```
+
+### Severity levels -- use the right one
+
+```python
+logger.debug("Detailed internal state, only useful when actively debugging")
+logger.info("Normal operation -- request received, run complete, cost logged")
+logger.warning("Something unexpected but recoverable -- fallback used, retry triggered")
+logger.error("Something broke -- orchestrator failed, exception caught")
+```
+
+Use `INFO` for normal operational events you always want to see. Use `ERROR` only for actual failures. Never use `ERROR` for expected paths (like a customer providing a non-existent order number -- that's a `WARNING` at most, not an error).
+
+### Structured log messages -- embed the data in the string
+
+The `logging` module supports an `extra={}` dict that attaches fields to the log record. However, with a standard formatter like `%(asctime)s - %(name)s - %(levelname)s - %(message)s`, those fields are **silently dropped** because the format string doesn't reference them by name.
+
+The reliable pattern is to embed the data directly in the message string using f-strings:
+
+```python
+# BAD: extra={} fields are invisible with standard formatters
+logger.info("Orchestrator run complete", extra={"category": output.category.value})
+
+# GOOD: all data visible in the log line
+usage = result.usage()
+logger.info(
+    f"Orchestrator run complete | user={ctx.user_email} | category={output.category.value} | "
+    f"input_tokens={usage.input_tokens} | output_tokens={usage.output_tokens} | requests={usage.requests}"
+)
+```
+
+Output:
+```
+2026-02-18 10:06:21 - src.triage_service - INFO - Orchestrator run complete | user=user1@gmail.com | category=refund | input_tokens=2189 | output_tokens=222 | requests=4
+```
+
+The `extra={}` approach is useful in production systems that ship logs to aggregators (Datadog, Grafana Loki) which parse JSON fields. For terminal output, the f-string pattern is clearer and safer.
+
+### What to log and what not to log
+
+| Location | Use | Why |
+|---|---|---|
+| `triage_service.py` | `logger.info` for run complete (with usage), `logger.error` for failures | Core operational events and cost tracking |
+| `api.py` | `logger.info` for request received/complete, `logger.warning` for 503 triggers | HTTP-level visibility |
+| `agents.py` | `logger.debug` inside tools if debugging a specific issue | Too noisy for permanent INFO logs |
+| `main.py` | Keep `print()` | These are intentional CLI output for the developer, not log events |
+
+The `print()` calls in `main.py` ("Dear client:", "Admin, do you approve?") are **not log messages** -- they are the user interface of the CLI. Replacing them with `logging` would be wrong; they'd get swallowed when the log level is set to WARNING.
+
+### Log usage after every orchestrator run
+
+Token cost is the most operationally important metric in an AI system. Log it after every run:
+
+```python
+usage = result.usage()
+logger.info(
+    f"Orchestrator run complete | user={ctx.user_email} | category={output.category.value} | "
+    f"input_tokens={usage.input_tokens} | output_tokens={usage.output_tokens} | requests={usage.requests}"
+)
+```
+
+`result.usage()` returns the **aggregate** across all delegate agents when you pass `usage=ctx.usage` to every delegate call. This single log line shows you the full cost of one customer request -- orchestrator + classifier + specialist + escalation combined.
+
+---
+
+## Interview Prep
+
+This section prepares you to explain this project clearly and confidently in a technical interview. Each question includes a short answer you can say out loud and a deeper explanation for follow-up questions.
+
+---
+
+### "Walk me through this project."
+
+**Short answer (30 seconds):**
+> "I built a customer support triage system using Pydantic AI. Customers send in queries via HTTP. An orchestrator LLM decides which specialist agents to call -- classifier, support specialist, or escalation manager. Python code then enforces business rules on the result. The system supports both standard JSON responses and real-time SSE streaming. It's wrapped in a FastAPI API, a NiceGUI browser UI, and a CLI for local testing."
+
+**What makes it interesting to talk about:**
+- Multi-agent delegation, not hardcoded routing
+- LLM decides, Python enforces (business rules live in code, not prompts)
+- Three entry points (API, UI, CLI) sharing the same service layer
+- Real-world challenges: LLM hallucinations, streaming latency, cost control
+
+---
+
+### "Why Pydantic AI instead of LangChain or LlamaIndex?"
+
+**Short answer:**
+> "Pydantic AI is Pythonic and minimal. It gives you type-safe structured output, native Pydantic model validation, and a clean dependency injection system -- without the abstraction layers that LangChain adds. I can read the Pydantic AI source and understand exactly what happens. With LangChain, there are so many layers of abstraction that debugging a bug can take you through five library files before you find the root cause."
+
+**Deeper:**
+- LangChain is powerful but heavily abstracted. It has its own concepts (chains, runnables, callbacks, LCEL) that you have to learn on top of Python and the LLM API.
+- Pydantic AI is built on top of Pydantic, which most Python engineers already know. The structured output is literally a Pydantic `BaseModel` -- no extra "schema definition language" to learn.
+- The dependency injection (`RunContext[AppContext]`) is type-safe. Your IDE gives you autocomplete inside tools and validators. LangChain's callback/chain system is much harder to trace statically.
+- For production systems where you need to understand every step, less abstraction is better.
+
+---
+
+### "Why agent delegation instead of hardcoded routing?"
+
+**Short answer:**
+> "Hardcoded routing uses Python if/else to decide which agent to call based on keywords or categories. Agent delegation lets the orchestrator LLM decide, based on what it read. This handles edge cases better -- a query like 'I have a technical problem AND I want a refund' would fail to route cleanly with hardcoded logic. The orchestrator can decide to call both the specialist and the escalation agent."
+
+**Deeper:**
+- We actually started with programmatic hand-off (Python explicitly calls classifier, then specialist, then escalation based on the classifier's output). It works, but it's rigid. The routing logic is in your Python code, not in the LLM that understands language.
+- With delegation, the orchestrator agent receives all available tools (classify, handle_support, escalate), reads the user's query, and decides the sequence itself. New tools can be added without changing the routing logic.
+- The tradeoff: delegation uses more tokens and is harder to trace, since the LLM's reasoning is not visible. For predictable, simple flows, programmatic hand-off is more reliable. For complex, unpredictable inputs, delegation is more flexible.
+
+---
+
+### "How do you handle LLM hallucinations?"
+
+**Short answer:**
+> "I split the problem into two categories. For quality issues -- vague replies, too-short answers -- I use `ModelRetry` in output validators to re-prompt the model and ask it to do better. For factual issues that only my code can verify -- like whether an order ID exists in the database -- I override the LLM's output directly in Python after the run completes. The LLM cannot know what's in my database. Python can."
+
+**Deeper:**
+- This distinction took a real bug to learn. I had a case where a user mentioned a non-existent order ID. The LLM would extract the order ID (correctly), then confidently describe what it would do for that order (hallucinating that the order existed).
+- I first tried using `ModelRetry` inside the output validator to re-prompt the model to set `order_id = null`. But the model kept extracting the same ID from the user's message -- because the user said it, and from the model's perspective it was doing the right thing. The retry loop exhausted and triggered the generic fallback.
+- The real fix: don't ask the LLM to re-decide. In `apply_business_rules()`, after the orchestrator run completes, check if the extracted `order_id` exists in the database. If it doesn't, construct a `FinalTriageResponse` directly in Python with the right `customer_reply` and return early. The LLM never sees this -- Python overrides it entirely.
+- Rule: **`ModelRetry` for quality issues the LLM can fix. Deterministic override for facts the LLM cannot know.**
+
+---
+
+### "How do you handle failures? What happens when the LLM API is down?"
+
+**Short answer:**
+> "There are three layers of error handling. First, each delegate tool has a try/except that returns a descriptive error string instead of raising. The orchestrator sees the error message and can adapt. Second, the triage service has a try/except around the orchestrator run that returns a fallback `FinalTriageResponse` with `category='unknown'`. Third, the API layer detects `category='unknown'` and converts it to an HTTP 503, so the client knows the service is degraded."
+
+**Deeper:**
+- Layer 1 (tool level): `try/except` in `classify_request`, `handle_support_request`, `escalate_to_manager`. Each returns a string like `"ERROR: Escalation failed: {error}"`. The orchestrator reads this and can flag for manual review.
+- Layer 2 (service level): `run_triage` and `run_triage_stream_events` both have outer `try/except` that catch any uncaught exception (connection errors, token limit exceeded, model timeout) and return a safe fallback response.
+- Layer 3 (API level): `api.py` checks if `result.category == RequestCategory.UNKNOWN`. If so, it raises `HTTPException(503)` with detail information so the caller knows it's a server-side issue, not bad input.
+- The `UNKNOWN` enum value is the sentinel that propagates through all three layers without requiring special exception types.
+
+---
+
+### "How do you manage costs? What prevents runaway token usage?"
+
+**Short answer:**
+> "`UsageLimits` on every agent run. I set both a `request_limit` (max LLM API calls per run, to prevent retry loops) and a `total_tokens_limit` (hard cap on tokens). I also pass `usage=ctx.usage` from delegate agents to the orchestrator, so I get a single aggregate usage number for the entire chain -- not just what the orchestrator used."
+
+**Deeper:**
+- Without `UsageLimits`, a `ModelRetry` loop can call the API dozens of times before crashing. With `request_limit=10`, it hard-stops at 10 calls.
+- The `usage=ctx.usage` pattern is how cost roll-up works. When you call a delegate agent inside a tool, passing the parent's usage object tells Pydantic AI to add all tokens used by the delegate to the parent's counter. One call to `result.usage()` at the end gives you the total cost across all agents.
+- In logging, after every orchestrator run, we log the usage: `logger.info(f"user={ctx.deps.user_email} category={output.category.value} usage={result.usage()}")`. This means every request is traceable by user and cost.
+- Model selection also matters: the classifier uses a local Ollama model (free, zero latency, fast) for the simple categorization task. Only complex reasoning uses the OpenAI cloud model.
+
+---
+
+### "How do you test an AI system? You can't unit test a language model."
+
+**Short answer:**
+> "You don't test the LLM -- you test everything around it. Business rules are pure Python functions that don't call any LLM. I can run 18 unit tests in milliseconds that verify every combination of category, order existence, and edge case in `apply_business_rules`. Output validators are also pure Python -- I use `MagicMock` to fake a `RunContext` and test that the validator correctly raises `ModelRetry` for bad inputs and passes good inputs."
+
+**Deeper:**
+- The core philosophy: separate what the LLM decides from what Python enforces. The LLM parts are expensive and non-deterministic -- you can't reliably unit test them. The Python parts (business rules, validators) are deterministic and free to test.
+- `tests/test_business_rules.py` has 9 tests covering: refund forces approval, general query needs no approval, non-existent order triggers override, tech support with known order preserves LLM judgment, and data integrity (other fields not affected by business rules).
+- `tests/test_validators.py` has 9 tests covering: valid output passes all validators, each rejection condition (short reply, vague action, invalid severity, short memo), and the streaming guard (`ctx.partial_output = True` skips validation).
+- `MagicMock` for `RunContext` is the key technique. You build a mock context with the data your validator needs, then call the validator directly. No agent, no LLM, no API key needed.
+
+---
+
+### "How does streaming work? Both at the agent level and at the API level?"
+
+**Short answer:**
+> "At the agent level, `agent.run_stream()` returns tokens as they arrive from the LLM. You call `result.stream_output()` to get partial structured output objects as they build up. At the API level, we use FastAPI `StreamingResponse` with Server-Sent Events -- the client gets newline-delimited JSON objects. We also add status events during tool calls, so the client knows what the agent is doing while it waits."
+
+**Deeper:**
+- The orchestrator pattern creates a latency problem: the real work (tool calls to classifier, specialist, escalation) happens before the orchestrator starts generating its structured output. So 90% of the time, the client is waiting with no data. That's why status events matter.
+- Status events use a callback pattern. `AppContext.on_status` is an optional async function. Delegate tools call it when they start: `await ctx.deps.on_status("Classifying request...")`. This function puts the message into an `asyncio.Queue`. The SSE generator drains the queue before yielding each partial output event.
+- Three event types: `status` (tool call progress), `customer_reply` (partial structured output during final streaming window), `final` (complete structured output).
+- The NiceGUI UI only shows the `customer_reply` card when the `final` event arrives. Partial reply events are silently ignored -- this prevents flickering or incomplete text appearing in the UI.
+
+---
+
+### "What's the hardest bug you fixed in this project?"
+
+**Short answer:**
+> "A business rule interaction bug combined with an LLM retry loop. A user asked for a refund on a non-existent order ID. My rule for 'non-existent orders' set `requires_human_approval = False`. My rule for 'refunds' set it to `True`. Both rules ran sequentially, and the second one always won -- a 'last-writer-wins' bug. I tried to fix it with `ModelRetry` in the validator to tell the LLM to stop extracting the order ID. But the LLM kept extracting it because the user literally said it. The retry loop exhausted and triggered the fallback error response."
+
+**What I learned:**
+- Business rules that modify the same field must be aware of each other's conditions, or one will silently overwrite the other.
+- `ModelRetry` cannot fix contradictions between what the user said and what your business rules want. If the user said `#123`, the LLM will always extract `#123`. You can't retry your way to a different extracted value.
+- The real fix: when a specific business rule fires (order not found), skip all remaining rules and return a complete `FinalTriageResponse` immediately. Early return, not flag mutation.
+
+---
+
+### "Would this work at scale? What would you change for production?"
+
+**Short answer:**
+> "The core architecture would hold up. The things I'd change are infrastructure, not design: replace the mock database with a real one (SQLite or PostgreSQL), add authentication to the API, route logs to a structured log aggregator (Datadog, CloudWatch), add integration tests that call the real agent with a real LLM, and containerize with Docker for reproducible deploys."
+
+**What's already production-ready:**
+- The service layer (`triage_service.py`) is completely decoupled from the HTTP layer. You can swap the API without changing any business logic.
+- The agent outputs are fully typed Pydantic models. There's no JSON parsing in the service layer -- it's all type-safe from agent output to HTTP response.
+- Layered error handling means no uncaught exceptions reach the client.
+- The logging setup captures user, category, and token usage for every request.
+- The `UNKNOWN` sentinel + HTTP 503 pattern means monitoring systems can detect agent failures without parsing error messages.
+
+**What would need to change:**
+- `MockDB` → real database with connection pooling
+- No authentication currently (API is open)
+- Logging goes to stdout -- fine for Docker, but you'd want a log shipper for aggregation
+- No integration tests (testing with real LLM calls, not just mocks)
+- No rate limiting on the API endpoints
+
+---
+
+### "Why is the classifier using Ollama (local model) while the orchestrator uses OpenAI?"
+
+**Short answer:**
+> "Classification is a simple, low-stakes task: put a message into one of four categories. A small local model handles this reliably and for free. The orchestrator needs to reason about which agents to call, combine their outputs, and produce a thoughtful customer reply -- that requires a capable cloud model. Using the right model for the right task keeps costs low without sacrificing quality where it matters."
+
+**Deeper:**
+- Local Ollama models (`llama3.2`) need `PromptedOutput(CustomerRequestResult)` instead of the plain `CustomerRequestResult` type, because smaller local models don't reliably follow the function-calling API for structured JSON. `PromptedOutput` wraps the schema as instructions in the system prompt instead, which smaller models handle better.
+- Cloud models (OpenAI `gpt-4.1-mini`) understand the function-calling protocol natively, so you pass the schema directly as `output_type=FinalTriageResponse`.
+- The cost calculation: classification runs on every single request. If classification uses a cloud model at $0.001/call and you have 10,000 requests/day, that's $10/day just for classification. A local model makes that $0.
+
+---
+
+### "Explain the AppContext design. Why is it a dataclass instead of a Pydantic model?"
+
+**Short answer:**
+> "`AppContext` is internal infrastructure -- it's never serialized, never sent over HTTP, never received from a user. Pydantic `BaseModel` adds validation overhead and is designed for data that arrives from untrusted sources (users, APIs, files). `dataclass` is lighter: it's just a container. The database instance, the user email string, and the callback function are all set directly by trusted Python code. There's nothing to validate."
+
+**When to use `dataclass` vs `BaseModel`:**
+- `BaseModel`: for data arriving from outside your code (HTTP request body, JSON files, LLM output). Validates, coerces, and rejects bad input.
+- `dataclass`: for internal data structures that your own code creates and controls. No validation needed, no serialization overhead.
+
+---
+
 ## Blueprint: Create Any Agent from a Description
 
 Follow this blueprint to create a new agent for any task. This is the process a master agent should follow when building agents from a description.
@@ -2187,6 +2603,9 @@ async with summary_agent.run_stream(
 - [ ] result.usage() tracked for cost monitoring (after get_output() for streaming)
 - [ ] Non-reasoning model chosen unless the task genuinely requires deep reasoning
 - [ ] Streaming support added if the agent is user-facing (run_stream + stream_output)
+- [ ] `logger = get_logger(__name__)` added to every service/API file (not main.py CLI)
+- [ ] Usage logged after every orchestrator run with user, category, and token counts
+- [ ] `logger.error` used in every `except` block that catches orchestrator/agent failures
 - [ ] Unit tests for business rules -- every combination of category, order existence, and edge cases
 - [ ] Unit tests for output validators -- happy path, each rejection rule, and streaming guard (`ctx.partial_output = True`)
 - [ ] Data integrity test -- verify non-approval fields are preserved through business rules
@@ -2237,6 +2656,7 @@ automated-ai-customer-support/
 ├── src/
 │   ├── agents.py            # Agent definitions, system prompts, tools, validators
 │   ├── config.py            # AppContext, model names, constants, feature flags
+│   ├── logger.py            # Shared logger factory -- get_logger(__name__) for every module
 │   ├── schemas.py           # Pydantic schemas (agent output + API request/response)
 │   ├── triage_service.py    # Business logic, agent orchestration, guardrails, streaming
 │   └── db.py                # Database layer (mock or real)
@@ -2254,6 +2674,7 @@ The separation:
 - `agents.py` defines HOW agents work -- all 4 agents live here (classifier, specialist, escalation, orchestrator) along with their system prompts, tools, and validators
 - `triage_service.py` defines WHEN and WHY agents are called (calls the orchestrator, applies business rules, handles both standard and streaming run modes)
 - `config.py` defines configuration (models, limits, feature flags like `IS_STREAM_RESPONSE_OUTPUT`)
+- `logger.py` is the shared logging factory -- all modules call `get_logger(__name__)` to get a consistently formatted logger. The `if not logger.handlers` guard prevents duplicate output when the same module is imported multiple times
 - `api.py` is the HTTP interface -- receives requests, creates per-request contexts, calls `run_triage` or `run_triage_stream_events`, and translates agent failures into proper HTTP status codes. Includes both standard JSON endpoint and SSE streaming endpoint
 - `main.py` is the CLI interface -- for local testing, `asyncio.gather` parallel runs, and human-in-the-loop approval
 - `ui.py` is the NiceGUI browser UI -- consumes `run_triage_stream_events` directly, displays status events as live progress and the final response once complete
