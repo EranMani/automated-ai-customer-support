@@ -10,6 +10,9 @@ from nicegui import ui
 from src.db import MockDB
 from src.config import AppContext
 from src.triage_service import run_triage_stream_events
+from src.logger import get_logger
+
+logger = get_logger(__name__)
 
 db_instance = MockDB()
 
@@ -116,6 +119,8 @@ def index():
             if not email or not query:
                 ui.notify("Please fill in both email and query.", type="warning")
                 return
+
+            logger.info(f"Triage request received | email={email} | query={query}")
 
             # Reset UI state
             submit_btn.props("loading")

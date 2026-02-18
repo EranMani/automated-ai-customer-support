@@ -5,7 +5,10 @@ from src.config import AppContext, SPECIALIST_REQUEST_LIMIT, SPECIALIST_TOTAL_TO
 from src.schemas import FinalTriageResponse, RequestCategory
 from pydantic_ai import UsageLimits
 from collections.abc import AsyncIterator
+from src.logger import get_logger
 import json
+
+logger = get_logger(__name__)
 
 async def process_refunds(ctx: AppContext, order_id: str) -> str:
     """
@@ -57,14 +60,20 @@ async def run_triage(ctx: AppContext, user_query: str) -> FinalTriageResponse:
                 total_tokens_limit=SPECIALIST_TOTAL_TOKENS_LIMIT
             )
         )
-        print(f"[Usage] Total orchestrator run - {result.usage()}")
-
+        
         # Business rules still applied deterministically
         output = apply_business_rules(ctx, result.output)
+
+        usage = result.usage()
+        logger.info(
+            f"Orchestrator run complete | user={ctx.user_email} | category={output.category.value} | "
+            f"input_tokens={usage.input_tokens} | output_tokens={usage.output_tokens} | requests={usage.requests}"
+        )
+
         return output
 
     except Exception as e:
-        print(f"Orchestrator failed: {e}")
+        logger.error(f"Orchestrator failed: {e}")
         return FinalTriageResponse(
             requires_human_approval=True,
             order_id=None,
@@ -95,13 +104,17 @@ async def run_triage_streaming(ctx: AppContext, user_query: str) -> FinalTriageR
             output = await result.get_output()
             # NOTE: get_output() is a blocking call that waits for the stream to complete and returns the final output.
             # call usage only after get_output() has been called, otherwise there will be incomplete numbers
-            print(f"[Usage] Total orchestrator run - {result.usage()}")
+            usage = result.usage()
+            logger.info(
+                f"Orchestrator run streaming complete | user={ctx.user_email} | category={output.category.value} | "
+                f"input_tokens={usage.input_tokens} | output_tokens={usage.output_tokens} | requests={usage.requests}"
+            )
 
         output = apply_business_rules(ctx, output)
         return output
         
     except Exception as e:
-        print(f"Orchestrator failed: {e}")
+        logger.error(f"Orchestrator failed: {e}")
         return FinalTriageResponse(
             requires_human_approval=True,
             order_id=None,
@@ -147,14 +160,19 @@ async def run_triage_stream_events(ctx: AppContext, user_query: str) -> AsyncIte
                     yield f"data: {json.dumps({"customer_reply": partial_output.customer_reply})}\n\n"
 
             output = await result.get_output()
-            print(f"[Usage] Total orchestrator run - {result.usage()}")
-    
+            
+            usage = result.usage()
+            logger.info(
+                f"Orchestrator run complete | user={ctx.user_email} | category={output.category.value} | "
+                f"input_tokens={usage.input_tokens} | output_tokens={usage.output_tokens} | requests={usage.requests}"
+            )
+                
         output = apply_business_rules(ctx, output)
         # This is the SSE format. Server-Sent Events have a specific text format: each event starts with data: , followed by the payload, followed by two newlines
         yield f"data: {json.dumps({'final': output.model_dump()})}\n\n"
 
     except Exception as e:
-        print(f"Orchestrator failed: {e}")
+        logger.error(f"Orchestrator failed: {e}")
         error_response = FinalTriageResponse(
             requires_human_approval=True,
             order_id=None,

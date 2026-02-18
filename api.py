@@ -4,6 +4,9 @@ from src.db import MockDB
 from src.config import AppContext
 from src.schemas import TriageRequest, FinalTriageResponse
 from src.triage_service import run_triage_streaming, run_triage_stream_events
+from src.logger import get_logger
+
+logger = get_logger(__name__)
 
 """
 NOTE: FastAPI() creates the application instance
@@ -38,6 +41,7 @@ async def health():
 # NOTE: POST endpoint because we're sending data (the customer's email and query)
 @app.post("/triage", response_model=FinalTriageResponse)
 async def triage(request: TriageRequest):
+    logger.info("Triage request received", extra={"email": request.email})
     # Create a per-request context with the shared DB and the user's email
     ctx = AppContext(db=db_instance, user_email=request.email)
     # Using await is critical. This is an async function, and run_triage is async
@@ -46,6 +50,7 @@ async def triage(request: TriageRequest):
 
     # Detect when the LLM returns an unknown category and return a custom error response
     if result.category == "unknown":
+        logger.warning("Orchestrator returned unknown category, returning 503", extra={"email": request.email})
         raise HTTPException(
             status_code=503,
             detail={
@@ -55,11 +60,13 @@ async def triage(request: TriageRequest):
             }
         )
 
+    logger.info("Triage request complete", extra={"email": request.email, "category": result.category.value})
     # FastAPI takes the FinalTriageResponse object and serializes it to JSON automatically because it's a Pydantic model.
     return result
 
 @app.post("/triage/stream")
 async def triage_stream(request: TriageRequest):
+    logger.info("Triage request received", extra={"email": request.email})
     ctx = AppContext(db=db_instance, user_email=request.email)
     # StreamingResponse takes an async generator and sends each yielded value to the client as it arrives, instead of buffering everything and sending it at once.
     return StreamingResponse(
