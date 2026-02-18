@@ -90,16 +90,18 @@ HTTP POST /triage {"email": "...", "query": "..."}
     v
 [FastAPI Response] -- HTTP 200 + FinalTriageResponse JSON
                    -- or HTTP 503 if orchestrator failed
+                   -- or SSE stream via /triage/stream (status + partial + final events)
 ```
 
 Key design decisions:
-- **HTTP API layer**: FastAPI serves the agent system over HTTP. Pydantic models are shared between agent output and API response -- zero conversion needed.
+- **HTTP API layer**: FastAPI serves the agent system over HTTP. Pydantic models are shared between agent output and API response -- zero conversion needed. Both standard (JSON) and streaming (SSE) endpoints are available.
 - **Agent delegation**: The orchestrator LLM decides which agents to call and in what order, instead of hardcoded Python `if/else` routing
 - **Multiple models**: Cheap local model (Ollama) for classification, capable cloud model (OpenAI) for complex reasoning and orchestration
 - **Structured output at every stage**: Classifier returns `CustomerRequestResult`, specialist returns `FinalTriageResponse`, escalation returns `EscalationResponse`
 - **Business rules in Python**: Refund approval, order existence checks, and approval flags are enforced by code, never by the LLM's judgment
 - **Usage roll-up**: All delegate agents pass `usage=ctx.usage` so the orchestrator tracks total cost across the entire chain
 - **Layered error handling**: Delegate failures absorbed by tools (Layer 1), orchestrator failures caught by triage service (Layer 2), fallback responses converted to HTTP 503 by the API (Layer 3)
+- **Status events via callbacks**: Delegate tools emit progress updates ("Classifying...", "Looking up account...") through an optional callback in `AppContext`, bridged to SSE via `asyncio.Queue`
 
 ---
 
@@ -141,16 +143,35 @@ The context carries per-request data and shared resources to your agent's system
 
 ```python
 from dataclasses import dataclass
+from typing import Callable, Awaitable
 
 @dataclass
 class AppContext:
     db: MockDB          # Shared resource -- one instance for all requests
     user_email: str     # Per-request data -- different for each user
+    on_status: Callable[[str], Awaitable[None]] | None = None  # Optional status callback
 ```
 
 Key distinction:
 - **Shared resources** (database connections, HTTP clients): Created once, passed to every context
 - **Per-request data** (user email, session ID): Different for each agent run, set when creating the context
+- **Optional callbacks** (`on_status`): Functions that distant parts of the code can call to communicate. Set to `None` by default so existing code (main.py, tests) doesn't need to change. Only the streaming API sets a real function here.
+
+### Callables as context fields
+
+A **callable** in Python is anything you can call with parentheses `()`. Functions are values -- you can store them in variables, pass them as arguments, and put them in dataclasses. The `on_status` field stores an optional async function:
+
+```python
+on_status: Callable[[str], Awaitable[None]] | None = None
+```
+
+Reading this type hint:
+- `Callable` -- it's a function you can call
+- `[[str]]` -- it takes one argument: a `str`
+- `Awaitable[None]` -- it's an `async` function (returns something you can `await`), with no meaningful return value
+- `| None = None` -- optional, defaults to `None`
+
+**Why put a function in the context?** Because agent tools and the SSE generator live in different files and can't directly communicate. Tools in `agents.py` know what's happening ("I'm classifying now") but can't send events to the client. The generator in `triage_service.py` can yield SSE events but can't see inside tool calls. The callback bridges this gap: the generator creates a function and stores it in `AppContext`. When a tool runs, it calls that function. The function puts the message somewhere the generator can pick it up. See [Status Events During Tool Calls](#status-events-during-tool-calls-callback--queue-pattern) for the full implementation.
 
 ### Step 3: Configure the Agent
 
@@ -928,6 +949,129 @@ results = await asyncio.gather(
 )
 ```
 
+### Status Events During Tool Calls (Callback + Queue Pattern)
+
+With the orchestrator pattern, the LLM performs all tool calls (classify, specialist, escalate) BEFORE it begins streaming its final output. This means the user stares at a blank screen while the real work happens. Status events solve this by sending updates like "Classifying your request..." and "Looking up your account..." during the tool call phase.
+
+**The problem:** The tools in `agents.py` know what's happening, but they're regular async functions -- they can't `yield` SSE events. The async generator in `triage_service.py` can yield SSE events, but it can't see inside the tools. These are two distant parts of the code that need to communicate.
+
+**The solution:** A **callback function** stored in `AppContext`, plus an `asyncio.Queue` to bridge the timing gap.
+
+#### Step 1: Add a status callback to AppContext
+
+```python
+@dataclass
+class AppContext:
+    db: MockDB
+    user_email: str
+    on_status: Callable[[str], Awaitable[None]] | None = None
+```
+
+`on_status` is an optional async function. When `None` (main.py, tests, non-streaming API), tools skip status events entirely. When set (streaming API), tools call it to emit status updates. The `None` default keeps all existing code backward-compatible.
+
+#### Step 2: Tools call the callback
+
+Each delegate tool in `agents.py` calls `on_status` before running its delegate agent:
+
+```python
+@orchestrator_agent.tool
+async def classify_request(ctx: RunContext[AppContext], customer_message: str) -> str:
+    """Classify the customer's message into a category."""
+    if ctx.deps.on_status:
+        await ctx.deps.on_status("Classifying your request...")
+    try:
+        result = await classifier_agent.run(user_prompt=customer_message, usage=ctx.usage)
+        return f"Category: {result.output.category.value}"
+    except Exception as e:
+        return f"ERROR: Classification failed: {str(e)}. Treat as general_query."
+```
+
+The `if ctx.deps.on_status:` guard is essential. Without it, calling `await None(...)` crashes. With it, tools silently skip status events when `on_status` is `None` (CLI mode, tests, non-streaming API).
+
+#### Step 3: The generator creates a callback and drains the queue
+
+In `triage_service.py`, the SSE generator creates an `asyncio.Queue` and a callback function that pushes SSE-formatted messages into the queue. The callback is stored in a new `AppContext` instance that gets passed to the orchestrator:
+
+```python
+async def run_triage_stream_events(ctx: AppContext, user_query: str) -> AsyncIterator[str]:
+    status_queue: asyncio.Queue[str] = asyncio.Queue()
+
+    async def emit_status(message: str):
+        await status_queue.put(f"data: {json.dumps({'status': message})}\n\n")
+
+    stream_ctx = AppContext(db=ctx.db, user_email=ctx.user_email, on_status=emit_status)
+
+    async with orchestrator_agent.run_stream(user_prompt=user_query, deps=stream_ctx, ...) as result:
+        # DRAIN: yield status events that arrived during tool calls
+        while not status_queue.empty():
+            yield await status_queue.get()
+
+        async for partial_output in result.stream_output():
+            # DRAIN: check for new status events between partial outputs
+            while not status_queue.empty():
+                yield await status_queue.get()
+            if partial_output.customer_reply:
+                yield f"data: {json.dumps({'customer_reply': partial_output.customer_reply})}\n\n"
+```
+
+#### Why the queue is needed
+
+There's a timing challenge. The tool callbacks fire DURING `run_stream()` -- inside the `async with` block. But the `yield` for SSE can only happen at the generator level. The `asyncio.Queue` bridges this gap:
+
+1. A tool calls `await ctx.deps.on_status("Classifying...")` -- which is `emit_status("Classifying...")`
+2. `emit_status` puts the SSE string into `status_queue`
+3. The generator drains `status_queue` at yield points and sends each message to the client
+
+Without the queue, the callback would need to yield directly from inside a tool -- which is impossible in Python (only the generator function itself can yield).
+
+**Critical: You must drain the queue.** If you create the queue and the callback but never read from the queue (`while not status_queue.empty(): yield await status_queue.get()`), the status messages pile up inside the queue and never reach the client. The drain loops must be placed at every yield point in the generator.
+
+#### The full data flow
+
+```
+run_triage_stream_events() creates:
+    - status_queue (asyncio.Queue)
+    - emit_status function (puts SSE strings into queue)
+    - stream_ctx with on_status=emit_status
+        |
+        v
+orchestrator_agent.run_stream(deps=stream_ctx)
+        |
+        |-- calls classify_request tool
+        |     ctx.deps.on_status("Classifying request...")
+        |     → emit_status("Classifying request...")
+        |     → status_queue.put("data: {"status": "Classifying request..."}\n\n")
+        |
+        |-- calls handle_support_request tool
+        |     ctx.deps.on_status("Looking up your account...")
+        |     → status_queue.put(...)
+        |
+        |-- starts streaming final output
+              |
+              v
+        generator drains status_queue → yields all status events
+        generator yields partial customer_reply events
+        generator yields final response event
+```
+
+#### What the client sees
+
+```
+data: {"status": "Classifying your request..."}
+
+data: {"status": "Looking up your account and order details..."}
+
+data: {"status": "Escalating to a senior representative..."}
+
+data: {"customer_reply": "We have received your refund request..."}
+
+data: {"final": {"requires_human_approval": true, ...}}
+```
+
+#### The timing reality
+
+Even with status events, there's a practical limitation. The orchestrator performs ALL tool calls before streaming its output. The status events are emitted during tool calls but only drained once `stream_output()` begins. So the status events arrive in a burst right when streaming starts, followed by partial outputs, followed by the final response. They're not truly progressive (arriving one by one during each tool call), but they still communicate what work was done -- which is valuable UX context.
+
 ---
 
 ## Multi-Agent Orchestration
@@ -1285,6 +1429,14 @@ Always verify your model name is valid. Use `result.usage()` to check for unexpe
 ### 15. Missing fields in manual FinalTriageResponse constructors
 **Wrong**: Creating fallback `FinalTriageResponse(requires_human_approval=True, order_id=None, ...)` without all required fields. If you add a new field like `category` to the schema, every manual constructor in fallback/exception paths will fail with `ValidationError: category Field required`.
 **Right**: When adding new required fields to output schemas, search for every manual constructor of that model (especially in `except` blocks) and add the new field with a sensible default like `category="unknown"`.
+
+### 16. Creating a callback queue but never draining it
+**Wrong**: Creating an `asyncio.Queue` and an `emit_status` callback, storing it in `AppContext`, but never reading from the queue in the generator. Status messages pile up in the queue and never reach the client.
+**Right**: Add `while not status_queue.empty(): yield await status_queue.get()` at every yield point in the generator -- both before and inside the `async for partial_output` loop.
+
+### 17. Calling `model_dump` without parentheses
+**Wrong**: `error_response.model_dump` -- references the method object itself, which serializes to something like `<bound method BaseModel.model_dump>`.
+**Right**: `error_response.model_dump()` -- calls the method and returns the actual dictionary.
 
 ---
 
@@ -1684,16 +1836,64 @@ Each layer handles a different scope of failure. Layer 1 absorbs delegate failur
 
 **Important insight:** If only a delegate fails (e.g., Ollama is down for the classifier), Layer 1 handles it. The orchestrator adapts, produces a valid response, and the API returns HTTP 200. The client never knows a delegate failed -- the system degraded gracefully. Only when the orchestrator itself fails does the client see a 503.
 
+### Streaming endpoint with Server-Sent Events (SSE)
+
+The standard `/triage` endpoint returns one JSON response when the agent finishes. The streaming `/triage/stream` endpoint sends progressive updates as the agent works, using the Server-Sent Events protocol.
+
+**SSE format**: Each event is a line starting with `data: ` followed by a JSON payload, followed by two newlines (`\n\n`). This is the standard SSE text format that browsers and HTTP clients understand.
+
+```python
+from fastapi.responses import StreamingResponse
+from src.triage_service import run_triage_stream_events
+
+@app.post("/triage/stream")
+async def triage_stream(request: TriageRequest):
+    ctx = AppContext(db=db_instance, user_email=request.email)
+    return StreamingResponse(
+        run_triage_stream_events(ctx, request.query),
+        media_type="text/event-stream"
+    )
+```
+
+**How it works:**
+1. FastAPI receives the POST request and creates an `AppContext`
+2. `StreamingResponse` wraps the `run_triage_stream_events` async generator
+3. Every time the generator `yield`s an SSE string, FastAPI sends it immediately to the client
+4. The connection stays open until the generator finishes (yields the final event)
+
+The generator yields three types of events:
+- `{"status": "Classifying your request..."}` -- tool call progress (from the callback/queue pattern)
+- `{"customer_reply": "We have received..."}` -- partial structured output as tokens arrive
+- `{"final": {...}}` -- the complete `FinalTriageResponse` with business rules applied
+
+**Testing with curl:**
+
+```bash
+# -N disables curl's output buffering so you see events as they arrive
+curl -X POST http://localhost:8000/triage/stream \
+    -H "Content-Type: application/json" \
+    -d '{"email": "user1@gmail.com", "query": "I want a refund for order #123"}' \
+    -N
+```
+
+**Note:** Swagger UI (`/docs`) doesn't handle SSE streaming properly -- it waits for the full response and shows everything at once. Use `curl -N` to see events arrive progressively.
+
 ### Running the API
 
 ```bash
 # Start the server with auto-reload for development
 uvicorn api:app --reload
 
-# Test with curl
+# Test standard endpoint
 curl -X POST http://localhost:8000/triage \
     -H "Content-Type: application/json" \
     -d '{"email": "user1@gmail.com", "query": "I want a refund for order #123"}'
+
+# Test streaming endpoint
+curl -X POST http://localhost:8000/triage/stream \
+    -H "Content-Type: application/json" \
+    -d '{"email": "user1@gmail.com", "query": "I want a refund for order #123"}' \
+    -N
 
 # Interactive docs (auto-generated from Pydantic models)
 # Open in browser: http://localhost:8000/docs
@@ -1833,6 +2033,18 @@ async with summary_agent.run_stream(
 - [ ] Error returns are descriptive strings the orchestrator can reason about
 - [ ] Orchestrator system prompt clearly describes available tools and the expected workflow
 - [ ] All manual `FinalTriageResponse` constructors (especially in `except` blocks) include every required field
+- [ ] Status callback (`if ctx.deps.on_status: await ctx.deps.on_status(...)`) added to each delegate tool for streaming UX
+
+### Additional checklist for API streaming endpoints
+
+- [ ] `on_status` callable added to `AppContext` as an optional field (defaults to `None`)
+- [ ] `asyncio.Queue` created in the SSE generator to bridge between tool callbacks and yields
+- [ ] `emit_status` function defined and stored in `AppContext.on_status`
+- [ ] Queue drain loops placed at every yield point in the generator (before and inside the stream loop)
+- [ ] Generator yields three event types: `status`, `customer_reply`, and `final`
+- [ ] Error handler in the generator yields a `final` event with fallback response (not just an exception)
+- [ ] `StreamingResponse` with `media_type="text/event-stream"` in the FastAPI endpoint
+- [ ] Tested with `curl -N` (not Swagger UI, which doesn't handle SSE properly)
 
 ---
 
@@ -1840,7 +2052,7 @@ async with summary_agent.run_stream(
 
 ```
 automated-ai-customer-support/
-├── api.py                   # FastAPI HTTP layer -- /triage, /health endpoints
+├── api.py                   # FastAPI HTTP layer -- /triage, /triage/stream, /health endpoints
 ├── main.py                  # CLI entry point -- for local testing and human-in-the-loop
 ├── src/
 │   ├── agents.py            # Agent definitions, system prompts, tools, validators
@@ -1862,6 +2074,6 @@ The separation:
 - `agents.py` defines HOW agents work -- all 4 agents live here (classifier, specialist, escalation, orchestrator) along with their system prompts, tools, and validators
 - `triage_service.py` defines WHEN and WHY agents are called (calls the orchestrator, applies business rules, handles both standard and streaming run modes)
 - `config.py` defines configuration (models, limits, feature flags like `IS_STREAM_RESPONSE_OUTPUT`)
-- `api.py` is the HTTP interface -- receives requests, creates per-request contexts, calls `run_triage`, and translates agent failures into proper HTTP status codes
+- `api.py` is the HTTP interface -- receives requests, creates per-request contexts, calls `run_triage` or `run_triage_stream_events`, and translates agent failures into proper HTTP status codes. Includes both standard JSON endpoint and SSE streaming endpoint
 - `main.py` is the CLI interface -- for local testing, `asyncio.gather` parallel runs, and human-in-the-loop approval
 - `tests/` verifies deterministic components (business rules, validators) without LLM calls -- fast, free, reliable
