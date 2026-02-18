@@ -6,6 +6,17 @@ NOTE: To create a logger for each file, we do this:
 from src.logger import get_logger
 logger = get_logger(__name__) # __name__ is the name of the current module
 NOTE: Use of structured logging - the log line carries machine-readable fields, not just a human-readable string
+example:
+logger.info(
+    "Orchestrator run complete",
+    extra={
+        "user_email": ctx.user_email,
+        "category": output.category.value,
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "requests": usage.requests,
+    }
+)
 """
 
 def get_logger(name: str) -> logging.Logger:
